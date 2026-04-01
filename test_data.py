@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class FusionNet(nn.Module):
@@ -180,6 +181,15 @@ def extract_features(segment, fs=100):
 
     features.append(skew(segment))
     features.append(kurtosis(segment))
+
+    # Peak amplitude variability
+    features.append(np.std(segment[peaks]) if len(peaks) > 2 else 0)
+
+    # Signal range
+    features.append(np.max(segment) - np.min(segment))
+
+    # Absolute mean
+    features.append(np.mean(np.abs(segment)))
     
     return features
 
@@ -214,7 +224,10 @@ for rec in records:
                 continue  # skip bad segment
             segment = (segment - np.mean(segment)) / (np.std(segment) + 1e-8)  
             if np.any(np.isnan(segment)) or np.any(np.isinf(segment)):
-                continue          
+                continue    
+            if np.max(segment) - np.min(segment) < 0.05:
+                continue
+      
             all_segments.append(segment)
             center = (start + end) // 2
             label_idx = center // window_size
@@ -259,14 +272,20 @@ train_idx, test_idx = train_test_split(
 X_train_f, X_test_f = X_features[train_idx], X_features[test_idx]
 y_train, y_test = y[train_idx], y[test_idx]
 
+pos = np.sum(y_train == 1)
+neg = np.sum(y_train == 0)
+
+scale = neg / pos
+pos_weight = torch.tensor([scale], dtype=torch.float32).to(device)
+scale_pos_weight=scale
 
 model = XGBClassifier(
-    n_estimators=800,
-    max_depth=10,
-    learning_rate=0.03,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    scale_pos_weight=(23514 / 14664),
+    n_estimators=1200,
+    max_depth=12,
+    learning_rate=0.02,
+    subsample=0.85,
+    colsample_bytree=0.85,
+    scale_pos_weight=scale,
     eval_metric='logloss'
 )
 
@@ -292,7 +311,6 @@ X_feat_train, X_feat_test = X_features[train_idx], X_features[test_idx]
 
 
 # ------ CNN / LSTM (PyTorch)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 X_signal_train_t = torch.tensor(X_signal_train.transpose(0, 2, 1), dtype=torch.float32)
 X_signal_test_t = torch.tensor(X_signal_test.transpose(0, 2, 1), dtype=torch.float32)
@@ -309,7 +327,7 @@ test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
 fusion_model = FusionNet(feature_dim=X_features.shape[1]).to(device)
 
-pos_weight = torch.tensor([23514 / 14664], dtype=torch.float32, device=device)
+
 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 optimizer = torch.optim.Adam(fusion_model.parameters(), lr=0.0002)
 
@@ -387,7 +405,15 @@ meta_train = np.column_stack([xgb_train_prob, cnn_train_prob])
 meta_test = np.column_stack([xgb_test_prob, cnn_test_prob])
 
 # Split train into train + val for stacking
-meta_model = LogisticRegression(C=0.5)
+meta_model = XGBClassifier(
+    n_estimators=300,
+    max_depth=3,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    eval_metric='logloss'
+)
+
 meta_model.fit(meta_train, y_train)
 
 final_pred = meta_model.predict(meta_test)

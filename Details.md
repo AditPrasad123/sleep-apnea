@@ -311,10 +311,13 @@ Raw ECG → segmentation → normalized segments
 ---
 
 
-> “We segment ECG signals into 30-second windows, extract physiological features, and also feed raw signals into a CNN-LSTM model. The outputs of both models are combined using a stacking approach to improve prediction accuracy.”
+> “We segment ECG signals into 30-second windows, extract physiological features, and simultaneously feed raw signals into a CNN-LSTM model. The outputs of both models are combined using a stacking approach to improve prediction accuracy.”
 
 ---
 
 
-> “We combine handcrafted physiological features with deep temporal representations using a stacking-based multimodal approach, improving robustness and interpretability.”
+> “We combine handcrafted physiological features with deep temporal representations using a hybrid feature learning and stacking-based ensemble approach, improving robustness and interpretability.”
 
+---
+
+> “We integrate handcrafted physiological features with deep temporal representations through a hybrid feature learning framework, followed by stacking-based ensemble learning to enhance robustness and interpretability.”
