@@ -623,9 +623,11 @@ def compute_signal_saliency(model, signal_sample, feature_sample):
     signal_tensor.requires_grad_(True)
     model.zero_grad(set_to_none=True)
 
-    logits = model(signal_tensor, feature_tensor)
-    probability = torch.sigmoid(logits)[0]
-    probability.backward()
+    # CuDNN LSTM backward requires training mode; disable CuDNN just for saliency backward.
+    with torch.backends.cudnn.flags(enabled=False):
+        logits = model(signal_tensor, feature_tensor)
+        probability = torch.sigmoid(logits)[0]
+        probability.backward()
 
     saliency = signal_tensor.grad.detach().abs().cpu().numpy()[0, 0]
     saliency = saliency / (saliency.max() + 1e-8)
