@@ -233,7 +233,7 @@ probability of apnea
 
 ---
 
-# 🧠 8. MODEL 2 — CNN + LSTM
+# 🧠 8. MODEL 2 — CNN-LSTM Hybrid Network
 
 ### Input:
 
@@ -263,7 +263,7 @@ probability of apnea
 
 ---
 
-# 🧠 9. MULTIMODAL FUSION
+# 🧠 9. HYBRID FEATURE FUSION
 
 Inside CNN model:
 
@@ -285,8 +285,10 @@ Inside CNN model:
 
 ### Model:
 
+The meta-model learns to optimally combine predictions from both models.
+
 ```text
-Logistic Regression
+XGBClassifier
 ```
 
 ---
@@ -306,15 +308,20 @@ Raw ECG → segmentation → normalized segments
 → Path 2: Raw signal → CNN + LSTM
 
 → Combine predictions → stacking → final output
+
+Feature-level fusion is performed within the deep learning model, while decision-level fusion is achieved through stacking.
 ```
 
 ---
 
 
-> “We segment ECG signals into 30-second windows, extract physiological features, and also feed raw signals into a CNN-LSTM model. The outputs of both models are combined using a stacking approach to improve prediction accuracy.”
+> “We segment ECG signals into 30-second windows, extract physiological features, and simultaneously feed raw signals into a CNN-LSTM model. The outputs of both models are combined using a stacking approach to improve prediction accuracy.”
 
 ---
 
 
-> “We combine handcrafted physiological features with deep temporal representations using a stacking-based multimodal approach, improving robustness and interpretability.”
+> “We combine handcrafted physiological features with deep temporal representations using a hybrid feature learning and stacking-based ensemble approach, improving robustness and interpretability.”
 
+---
+
+> “We integrate handcrafted physiological features with deep temporal representations through a hybrid feature learning framework, followed by stacking-based ensemble learning to enhance robustness and interpretability.”
