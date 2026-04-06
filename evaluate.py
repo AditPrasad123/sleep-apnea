@@ -24,6 +24,7 @@ from pipeline import (
     DEVICE,
     FusionNet,
     artifact_path,
+    build_ecg_edr_signal,
     build_feature_matrix,
     compute_signal_saliency,
     compute_signal_saliency_signal_only,
@@ -348,7 +349,7 @@ def main():
 
     x_features = build_feature_matrix(x_signal)
     x_features = scaler.transform(x_features)
-    x_signal = x_signal[..., np.newaxis]
+    x_signal = build_ecg_edr_signal(x_signal, fs=metadata["fs"])
 
     x_test_f = x_features[test_idx]
     y_test = y[test_idx]
@@ -371,14 +372,16 @@ def main():
     if "cnn" in requested:
         cnn_path = artifact_path("cnn_model.pt")
         ensure_file_exists(cnn_path)
-        cnn_model = CNNBaseline().to(DEVICE)
+        signal_channels = int(metadata.get("signal_channels", 1))
+        cnn_model = CNNBaseline(input_channels=signal_channels).to(DEVICE)
         cnn_model.load_state_dict(torch.load(cnn_path, map_location=DEVICE))
         cnn_model.eval()
 
     if "fusionnet" in requested or "stacking" in requested:
         fusion_path = artifact_path("fusion_model.pt")
         ensure_file_exists(fusion_path)
-        fusion_model = FusionNet(feature_dim=metadata["feature_dim"]).to(DEVICE)
+        signal_channels = int(metadata.get("signal_channels", 1))
+        fusion_model = FusionNet(feature_dim=metadata["feature_dim"], input_channels=signal_channels).to(DEVICE)
         fusion_model.load_state_dict(torch.load(fusion_path, map_location=DEVICE))
         fusion_model.eval()
 
@@ -415,11 +418,11 @@ def main():
         cnn_uncertain_index = int(np.argmax(cnn_base_uncertainty))
         cnn_saliency, cnn_saliency_prob = compute_signal_saliency_signal_only(
             cnn_model,
-            x_signal_test[cnn_uncertain_index].squeeze(),
+            x_signal_test[cnn_uncertain_index].T,
         )
         save_saliency_plot(
             cnn_model_dir,
-            x_signal_test[cnn_uncertain_index].squeeze(),
+            x_signal_test[cnn_uncertain_index, :, 0],
             cnn_saliency,
             cnn_saliency_prob,
             fs=metadata["fs"],
@@ -436,12 +439,12 @@ def main():
         most_uncertain_index = int(np.argmax(cnn_uncertainty))
         saliency, saliency_prob = compute_signal_saliency(
             fusion_model,
-            x_signal_test[most_uncertain_index].squeeze(),
+            x_signal_test[most_uncertain_index].T,
             x_feat_test[most_uncertain_index],
         )
         save_saliency_plot(
             cnn_model_dir,
-            x_signal_test[most_uncertain_index].squeeze(),
+            x_signal_test[most_uncertain_index, :, 0],
             saliency,
             saliency_prob,
             fs=metadata["fs"],

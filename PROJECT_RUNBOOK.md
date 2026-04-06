@@ -18,15 +18,17 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 1. Load ECG + annotations with `wfdb`
 2. Segment signal into 30s windows (3000 samples at 100 Hz), stride 10s
 3. Segment cleaning + z-score normalization
-4. Feature extraction (~30 handcrafted features)
-5. Standard scaling of feature matrix
-6. Shared stratified split indices for consistent comparisons
-7. Train/evaluate selected model(s)
+4. Derive EDR (ECG-derived respiration) per ECG segment from R-peak amplitude modulation
+5. Build 2-channel signal tensor `[ECG, EDR]` for signal models
+6. Feature extraction (~30 handcrafted features)
+7. Standard scaling of feature matrix
+8. Shared stratified split indices for consistent comparisons
+9. Train/evaluate selected model(s)
 
 ## Models and What Exists
 1. XGBoost: engineered features only
-2. CNN baseline: raw ECG signal only
-3. FusionNet: CNN + BiLSTM on signal + dense feature branch
+2. CNN baseline: 2-channel ECG+EDR signal
+3. FusionNet: CNN + BiLSTM on ECG+EDR signal + dense feature branch
 4. Stacking: XGBoost + FusionNet probabilities into XGBoost meta-model
 
 ## Explainability + Uncertainty
@@ -182,9 +184,10 @@ Additional model-specific outputs:
 1. `test_data.py` now just launches `train.py` for backward compatibility.
 2. Re-train after architecture or training-logic changes before evaluating.
 3. Stacking compares XGBoost + FusionNet (not XGBoost + CNN baseline).
-4. MC dropout is used directly for CNN and FusionNet uncertainty; tree models do not use MC dropout directly.
-5. For stacking uncertainty, FusionNet MC-dropout samples are propagated through the stacking model.
-6. SHAP outputs are optional and are skipped automatically if SHAP is not installed.
+4. CNN/FusionNet now consume fused signal streams: ECG + EDR.
+5. MC dropout is used directly for CNN and FusionNet uncertainty; tree models do not use MC dropout directly.
+6. For stacking uncertainty, FusionNet MC-dropout samples are propagated through the stacking model.
+7. SHAP outputs are optional and are skipped automatically if SHAP is not installed.
 
 ## Paper-Oriented Reporting Pointers
 1. Use identical test split across all models (already enforced via saved indices).

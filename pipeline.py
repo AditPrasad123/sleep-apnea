@@ -26,6 +26,7 @@ EPOCHS = 20
 TRAIN_BATCH_SIZE = 32
 EVAL_BATCH_SIZE = 64
 MC_DROPOUT_PASSES = 25
+SIGNAL_CHANNELS = 2
 
 FEATURE_NAMES = [
     "mean",
@@ -64,11 +65,11 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class FusionNet(nn.Module):
-    def __init__(self, feature_dim):
+    def __init__(self, feature_dim, input_channels=SIGNAL_CHANNELS):
         super().__init__()
 
         self.signal_conv = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=5, padding=2),
+            nn.Conv1d(input_channels, 32, kernel_size=5, padding=2),
             nn.ReLU(),
             nn.BatchNorm1d(32),
             nn.MaxPool1d(kernel_size=2),
@@ -129,10 +130,10 @@ class FusionNet(nn.Module):
 
 
 class CNNBaseline(nn.Module):
-    def __init__(self):
+    def __init__(self, input_channels=SIGNAL_CHANNELS):
         super().__init__()
         self.backbone = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=7, padding=3),
+            nn.Conv1d(input_channels, 32, kernel_size=7, padding=3),
             nn.ReLU(),
             nn.BatchNorm1d(32),
             nn.MaxPool1d(kernel_size=2),
@@ -272,6 +273,42 @@ def extract_features(segment, fs=FS):
     return features
 
 
+def derive_edr_from_ecg(segment, fs=FS):
+    segment = np.nan_to_num(np.asarray(segment, dtype=np.float32))
+    if segment.size == 0:
+        return segment
+
+    peaks, _ = find_peaks(segment, distance=max(1, int(0.3 * fs)))
+
+    if len(peaks) >= 2:
+        # Use beat-to-beat R-peak amplitude modulation as a respiration surrogate.
+        r_amplitudes = segment[peaks]
+        edr = np.interp(np.arange(len(segment)), peaks, r_amplitudes)
+    else:
+        # Fallback to a slow trend when R-peak extraction is unreliable.
+        smooth_window = max(3, int(1.0 * fs))
+        kernel = np.ones(smooth_window, dtype=np.float32) / float(smooth_window)
+        edr = np.convolve(segment, kernel, mode="same")
+
+    post_window = max(3, int(0.5 * fs))
+    post_kernel = np.ones(post_window, dtype=np.float32) / float(post_window)
+    edr = np.convolve(edr, post_kernel, mode="same")
+
+    edr_std = np.std(edr)
+    if edr_std > 0:
+        edr = (edr - np.mean(edr)) / (edr_std + 1e-8)
+    else:
+        edr = np.zeros_like(segment, dtype=np.float32)
+
+    return np.asarray(edr, dtype=np.float32)
+
+
+def build_ecg_edr_signal(x_signal, fs=FS):
+    ecg_signal = np.asarray(x_signal, dtype=np.float32)
+    edr_signal = np.array([derive_edr_from_ecg(seg, fs=fs) for seg in ecg_signal], dtype=np.float32)
+    return np.stack([ecg_signal, edr_signal], axis=2)
+
+
 def load_segments_and_labels(data_dir, fs=FS, window_seconds=WINDOW_SECONDS, stride_seconds=STRIDE_SECONDS):
     window_size = fs * window_seconds
     stride = fs * stride_seconds
@@ -374,6 +411,7 @@ def train_fusion_model(
     y_test,
     pos_weight,
     feature_dim,
+    input_channels=SIGNAL_CHANNELS,
 ):
     x_signal_train_t = torch.tensor(x_signal_train.transpose(0, 2, 1), dtype=torch.float32)
     x_signal_test_t = torch.tensor(x_signal_test.transpose(0, 2, 1), dtype=torch.float32)
@@ -388,7 +426,7 @@ def train_fusion_model(
     train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=EVAL_BATCH_SIZE, shuffle=False)
 
-    fusion_model = FusionNet(feature_dim=feature_dim).to(DEVICE)
+    fusion_model = FusionNet(feature_dim=feature_dim, input_channels=input_channels).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(fusion_model.parameters(), lr=0.0002)
 
@@ -434,7 +472,14 @@ def train_fusion_model(
     return fusion_model
 
 
-def train_cnn_baseline(x_signal_train, x_signal_test, y_train, y_test, pos_weight):
+def train_cnn_baseline(
+    x_signal_train,
+    x_signal_test,
+    y_train,
+    y_test,
+    pos_weight,
+    input_channels=SIGNAL_CHANNELS,
+):
     x_signal_train_t = torch.tensor(x_signal_train.transpose(0, 2, 1), dtype=torch.float32)
     x_signal_test_t = torch.tensor(x_signal_test.transpose(0, 2, 1), dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.float32)
@@ -446,7 +491,7 @@ def train_cnn_baseline(x_signal_train, x_signal_test, y_train, y_test, pos_weigh
     train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=EVAL_BATCH_SIZE, shuffle=False)
 
-    model = CNNBaseline().to(DEVICE)
+    model = CNNBaseline(input_channels=input_channels).to(DEVICE)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
 
@@ -703,6 +748,8 @@ def save_artifacts(scaler, xgb_model, cnn_model, fusion_model, meta_model, train
             "random_state": RANDOM_STATE,
             "feature_dim": int(feature_dim),
             "feature_names": FEATURE_NAMES,
+            "signal_channels": SIGNAL_CHANNELS,
+            "signal_streams": ["ecg", "edr"],
         },
         "metadata.json",
     )
@@ -715,11 +762,13 @@ def load_artifacts():
     metadata = load_json("metadata.json")
     train_idx = load_array("train_idx.npy")
     test_idx = load_array("test_idx.npy")
-    cnn_model = CNNBaseline().to(DEVICE)
+    signal_channels = int(metadata.get("signal_channels", 1))
+
+    cnn_model = CNNBaseline(input_channels=signal_channels).to(DEVICE)
     cnn_model.load_state_dict(torch.load(artifact_path("cnn_model.pt"), map_location=DEVICE))
     cnn_model.eval()
 
-    fusion_model = FusionNet(feature_dim=metadata["feature_dim"]).to(DEVICE)
+    fusion_model = FusionNet(feature_dim=metadata["feature_dim"], input_channels=signal_channels).to(DEVICE)
     fusion_model.load_state_dict(torch.load(artifact_path("fusion_model.pt"), map_location=DEVICE))
     fusion_model.eval()
     return scaler, xgb_model, cnn_model, fusion_model, meta_model, train_idx, test_idx, metadata

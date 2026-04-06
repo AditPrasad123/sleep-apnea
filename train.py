@@ -9,11 +9,13 @@ from pipeline import (
     DATA_DIR,
     FEATURE_NAMES,
     RANDOM_STATE,
+    SIGNAL_CHANNELS,
     STRIDE_SECONDS,
     TEST_SIZE,
     WINDOW_SECONDS,
     FS,
     artifact_path,
+    build_ecg_edr_signal,
     build_feature_matrix,
     build_train_test_split,
     compute_class_weights,
@@ -63,6 +65,8 @@ def save_common_artifacts(scaler, train_idx, test_idx, feature_dim):
             "random_state": RANDOM_STATE,
             "feature_dim": int(feature_dim),
             "feature_names": FEATURE_NAMES,
+            "signal_channels": SIGNAL_CHANNELS,
+            "signal_streams": ["ecg", "edr"],
         },
         "metadata.json",
     )
@@ -105,7 +109,7 @@ def main():
     cnn_train_prob = None
     cnn_test_prob = None
 
-    x_signal = x_signal[..., np.newaxis]
+    x_signal = build_ecg_edr_signal(x_signal, fs=FS)
     x_signal_train = x_signal[train_idx]
     x_signal_test = x_signal[test_idx]
     x_feat_train = x_features[train_idx]
@@ -125,6 +129,7 @@ def main():
             y_train,
             y_test,
             pos_weight,
+            input_channels=x_signal.shape[2],
         )
         cnn_base_test_prob = predict_probs_signal(cnn_model, x_signal_test)
         cnn_base_preds = (cnn_base_test_prob >= 0.5).astype(int)
@@ -144,6 +149,7 @@ def main():
             y_test,
             pos_weight,
             feature_dim=x_features.shape[1],
+            input_channels=x_signal.shape[2],
         )
 
         cnn_train_prob = predict_probs(fusion_model, x_signal_train, x_feat_train)
