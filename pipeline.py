@@ -674,8 +674,14 @@ def compute_signal_saliency(model, signal_sample, feature_sample):
         probability = torch.sigmoid(logits)[0]
         probability.backward()
 
-    saliency = signal_tensor.grad.detach().abs().cpu().numpy()[0, 0]
-    saliency = saliency / (saliency.max() + 1e-8)
+    saliency = signal_tensor.grad.detach().abs().cpu().numpy()[0]
+    if saliency.ndim == 1:
+        saliency = saliency[np.newaxis, :]
+
+    for channel in range(saliency.shape[0]):
+        channel_max = saliency[channel].max()
+        saliency[channel] = saliency[channel] / (channel_max + 1e-8)
+
     return saliency, float(probability.detach().cpu().item())
 
 
@@ -696,8 +702,14 @@ def compute_signal_saliency_signal_only(model, signal_sample):
     probability = torch.sigmoid(logits)[0]
     probability.backward()
 
-    saliency = signal_tensor.grad.detach().abs().cpu().numpy()[0, 0]
-    saliency = saliency / (saliency.max() + 1e-8)
+    saliency = signal_tensor.grad.detach().abs().cpu().numpy()[0]
+    if saliency.ndim == 1:
+        saliency = saliency[np.newaxis, :]
+
+    for channel in range(saliency.shape[0]):
+        channel_max = saliency[channel].max()
+        saliency[channel] = saliency[channel] / (channel_max + 1e-8)
+
     return saliency, float(probability.detach().cpu().item())
 
 

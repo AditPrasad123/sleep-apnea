@@ -314,23 +314,39 @@ def save_stacking_explainability(model_dir, meta_model):
     plt.close(fig)
 
 
-def save_saliency_plot(model_dir, signal_sample, saliency, probability, fs=100):
-    time_axis = np.arange(len(signal_sample)) / fs
-    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+def save_saliency_plots(model_dir, signal_sample_tc, saliency_ct, probability, fs=100):
+    signal_sample_tc = np.asarray(signal_sample_tc)
+    saliency_ct = np.asarray(saliency_ct)
 
-    axes[0].plot(time_axis, signal_sample, color="#1f77b4", linewidth=1.0)
-    axes[0].set_title(f"ECG Signal with Saliency Overlay (p={probability:.3f})")
-    axes[0].set_ylabel("Normalized amplitude")
+    if signal_sample_tc.ndim == 1:
+        signal_sample_tc = signal_sample_tc[:, np.newaxis]
+    if saliency_ct.ndim == 1:
+        saliency_ct = saliency_ct[np.newaxis, :]
 
-    axes[1].plot(time_axis, saliency, color="#d62728", linewidth=1.0)
-    axes[1].fill_between(time_axis, saliency, color="#d62728", alpha=0.3)
-    axes[1].set_title("Temporal Saliency")
-    axes[1].set_xlabel("Time (seconds)")
-    axes[1].set_ylabel("Normalized saliency")
+    channel_names = ["ecg", "edr"]
+    channel_count = min(signal_sample_tc.shape[1], saliency_ct.shape[0])
 
-    fig.tight_layout()
-    fig.savefig(os.path.join(model_dir, "saliency_map.png"), dpi=200)
-    plt.close(fig)
+    for channel in range(channel_count):
+        name = channel_names[channel] if channel < len(channel_names) else f"channel_{channel}"
+        signal_series = signal_sample_tc[:, channel]
+        saliency_series = saliency_ct[channel]
+
+        time_axis = np.arange(len(signal_series)) / fs
+        fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+        axes[0].plot(time_axis, signal_series, color="#1f77b4", linewidth=1.0)
+        axes[0].set_title(f"{name.upper()} Signal (p={probability:.3f})")
+        axes[0].set_ylabel("Normalized amplitude")
+
+        axes[1].plot(time_axis, saliency_series, color="#d62728", linewidth=1.0)
+        axes[1].fill_between(time_axis, saliency_series, color="#d62728", alpha=0.3)
+        axes[1].set_title(f"Temporal Saliency - {name.upper()}")
+        axes[1].set_xlabel("Time (seconds)")
+        axes[1].set_ylabel("Normalized saliency")
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(model_dir, f"saliency_map_{name}.png"), dpi=200)
+        plt.close(fig)
 
 
 def main():
@@ -420,9 +436,9 @@ def main():
             cnn_model,
             x_signal_test[cnn_uncertain_index].T,
         )
-        save_saliency_plot(
+        save_saliency_plots(
             cnn_model_dir,
-            x_signal_test[cnn_uncertain_index, :, 0],
+            x_signal_test[cnn_uncertain_index],
             cnn_saliency,
             cnn_saliency_prob,
             fs=metadata["fs"],
@@ -442,9 +458,9 @@ def main():
             x_signal_test[most_uncertain_index].T,
             x_feat_test[most_uncertain_index],
         )
-        save_saliency_plot(
+        save_saliency_plots(
             cnn_model_dir,
-            x_signal_test[most_uncertain_index, :, 0],
+            x_signal_test[most_uncertain_index],
             saliency,
             saliency_prob,
             fs=metadata["fs"],
