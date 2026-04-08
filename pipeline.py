@@ -6,9 +6,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import wfdb
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, resample_poly
 from scipy.stats import kurtosis, skew
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
@@ -17,6 +27,7 @@ from xgboost import XGBClassifier
 
 DATA_DIR = "apnea_data"
 ARTIFACT_DIR = "artifacts"
+CROSS_ARTIFACT_DIR = os.path.join(ARTIFACT_DIR, "cross-dataset-models")
 FS = 100
 WINDOW_SECONDS = 30
 STRIDE_SECONDS = 10
@@ -60,6 +71,8 @@ FEATURE_NAMES = [
     "signal_range",
     "abs_mean",
 ]
+
+APNEA_TOKENS = {"OA", "X", "CA", "CAA", "H", "HA"}
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -162,23 +175,202 @@ class CNNBaseline(nn.Module):
         return logits
 
 
-def ensure_artifact_dir():
-    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+def ensure_artifact_dir(base_dir=ARTIFACT_DIR):
+    os.makedirs(base_dir, exist_ok=True)
 
 
-def artifact_path(name):
-    return os.path.join(ARTIFACT_DIR, name)
+def artifact_path(name, base_dir=ARTIFACT_DIR):
+    return os.path.join(base_dir, name)
 
 
-def save_json(data, filename):
-    ensure_artifact_dir()
-    with open(artifact_path(filename), "w", encoding="utf-8") as handle:
+def cross_artifact_path(name):
+    return artifact_path(name, base_dir=CROSS_ARTIFACT_DIR)
+
+
+def save_json(data, filename, base_dir=ARTIFACT_DIR):
+    ensure_artifact_dir(base_dir)
+    with open(artifact_path(filename, base_dir=base_dir), "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
 
 
-def load_json(filename):
-    with open(artifact_path(filename), "r", encoding="utf-8") as handle:
+def load_json(filename, base_dir=ARTIFACT_DIR):
+    with open(artifact_path(filename, base_dir=base_dir), "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def normalize_segment(segment):
+    segment = np.nan_to_num(np.asarray(segment, dtype=np.float32))
+    std = np.std(segment)
+    if std <= 0:
+        return None
+    segment = (segment - np.mean(segment)) / (std + 1e-8)
+    if np.any(np.isnan(segment)) or np.any(np.isinf(segment)):
+        return None
+    if np.max(segment) - np.min(segment) < 0.05:
+        return None
+    return np.asarray(segment, dtype=np.float32)
+
+
+def tokenize_aux(note):
+    return [token.strip().upper() for token in note.strip().split() if token.strip()]
+
+
+def has_apnea_event(note):
+    return any(token in APNEA_TOKENS for token in tokenize_aux(note))
+
+
+def select_ecg_channel(record):
+    sig_names = [name.lower() for name in record.sig_name]
+    for idx, name in enumerate(sig_names):
+        if "ecg" in name:
+            return idx
+    return 0
+
+
+def resample_to_target(segment, original_fs, target_fs=FS):
+    if int(round(original_fs)) == int(target_fs):
+        return np.asarray(segment, dtype=np.float32)
+
+    original_fs_int = int(round(original_fs))
+    target_fs_int = int(target_fs)
+    resampled = resample_poly(segment, up=target_fs_int, down=original_fs_int)
+
+    target_len = target_fs_int * 30
+    if len(resampled) > target_len:
+        resampled = resampled[:target_len]
+    elif len(resampled) < target_len:
+        padded = np.zeros(target_len, dtype=np.float32)
+        padded[: len(resampled)] = resampled
+        resampled = padded
+
+    return np.asarray(resampled, dtype=np.float32)
+
+
+def load_apnea_ecg_segments_30s(data_dir=DATA_DIR, fs=FS):
+    window = fs * 30
+    minute = fs * 60
+
+    segments = []
+    labels = []
+
+    records = sorted(name[:-4] for name in os.listdir(data_dir) if name.endswith(".dat"))
+
+    for rec in records:
+        try:
+            ann = wfdb.rdann(os.path.join(data_dir, rec), "apn")
+            record = wfdb.rdrecord(os.path.join(data_dir, rec))
+        except Exception:
+            continue
+
+        signal = record.p_signal[:, 0]
+        minute_labels = ann.symbol
+
+        for start in range(0, len(signal) - window + 1, window):
+            end = start + window
+            minute_idx = start // minute
+            if minute_idx >= len(minute_labels):
+                continue
+
+            segment = normalize_segment(signal[start:end])
+            if segment is None:
+                continue
+
+            label = 1 if minute_labels[minute_idx] == "A" else 0
+            segments.append(segment)
+            labels.append(label)
+
+    return np.array(segments, dtype=np.float32), np.array(labels, dtype=np.int64)
+
+
+def load_mitbih_psg_segments_30s(data_dir="mitbih_psg_data", target_fs=FS):
+    segments = []
+    labels = []
+
+    records = sorted(name[:-4] for name in os.listdir(data_dir) if name.endswith(".hea"))
+
+    for rec in records:
+        try:
+            record = wfdb.rdrecord(os.path.join(data_dir, rec))
+            ann = wfdb.rdann(os.path.join(data_dir, rec), "st")
+        except Exception:
+            continue
+
+        ecg_idx = select_ecg_channel(record)
+        ecg = record.p_signal[:, ecg_idx]
+        record_fs = float(record.fs)
+        window = int(round(30 * record_fs))
+
+        for i, start in enumerate(ann.sample):
+            start = int(start)
+            end = start + window
+            if end > len(ecg):
+                continue
+
+            raw_segment = ecg[start:end]
+            resampled = resample_to_target(raw_segment, original_fs=record_fs, target_fs=target_fs)
+            segment = normalize_segment(resampled)
+            if segment is None:
+                continue
+
+            note = ann.aux_note[i] if i < len(ann.aux_note) else ""
+            label = 1 if has_apnea_event(note) else 0
+            segments.append(segment)
+            labels.append(label)
+
+    return np.array(segments, dtype=np.float32), np.array(labels, dtype=np.int64)
+
+
+def summarize_split(name, y):
+    positives = int(np.sum(y == 1))
+    negatives = int(np.sum(y == 0))
+    print(f"{name}: n={len(y)}, apnea={positives}, normal={negatives}")
+
+
+def compute_cross_metrics(y_true, y_prob, threshold=0.5):
+    y_pred = (y_prob >= threshold).astype(int)
+    auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan")
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    mcc = matthews_corrcoef(y_true, y_pred) if len(np.unique(y_pred)) > 1 else 0.0
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp + 1e-8)
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "auc_roc": float(auc),
+        "balanced_accuracy": float(bal_acc),
+        "mcc": float(mcc),
+        "specificity": float(specificity),
+        "threshold": float(threshold),
+        "confusion_matrix": {
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
+        },
+    }
+
+
+def tune_cross_threshold(y_true, y_prob, metric_name):
+    metric_key = {
+        "f1": "f1",
+        "balanced_accuracy": "balanced_accuracy",
+        "mcc": "mcc",
+    }[metric_name]
+
+    thresholds = np.linspace(0.05, 0.95, 91)
+    best_threshold = 0.5
+    best_score = -np.inf
+
+    for threshold in thresholds:
+        metrics = compute_cross_metrics(y_true, y_prob, threshold=float(threshold))
+        score = metrics[metric_key]
+        if score > best_score:
+            best_score = score
+            best_threshold = float(threshold)
+
+    return best_threshold, float(best_score)
 
 
 def extract_features(segment, fs=FS):
@@ -732,13 +924,13 @@ def train_stacking(xgb_train_prob, xgb_test_prob, cnn_train_prob, cnn_test_prob,
     return meta_model
 
 
-def save_array(name, array):
-    ensure_artifact_dir()
-    np.save(artifact_path(name), array)
+def save_array(name, array, base_dir=ARTIFACT_DIR):
+    ensure_artifact_dir(base_dir)
+    np.save(artifact_path(name, base_dir=base_dir), array)
 
 
-def load_array(name):
-    return np.load(artifact_path(name), allow_pickle=False)
+def load_array(name, base_dir=ARTIFACT_DIR):
+    return np.load(artifact_path(name, base_dir=base_dir), allow_pickle=False)
 
 
 def save_artifacts(scaler, xgb_model, cnn_model, fusion_model, meta_model, train_idx, test_idx, feature_dim):

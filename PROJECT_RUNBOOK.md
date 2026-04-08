@@ -10,8 +10,8 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 ## Current File Roles
 - `download_dataset.py`: downloads Apnea-ECG into `apnea_data/`
 - `pipeline.py`: shared data pipeline, model definitions, training helpers, artifact I/O
-- `train.py`: selective training CLI
-- `evaluate.py`: selective evaluation CLI + metrics/plots/analysis outputs
+- `train.py`: selective training CLI for both normal and cross-dataset modes
+- `evaluate.py`: selective evaluation CLI for both normal and cross-dataset modes
 - `test_data.py`: compatibility launcher (calls `train.py`)
 
 ## Data + Pipeline Flow
@@ -55,25 +55,42 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 ## Training CLI (Selective)
 Run from repo root:
 
+### Normal mode (default)
 - Train all models:
-  - `python train.py`
+  - `python train.py --mode normal --models all`
   - or `python train.py --models all`
 
 - Train only XGBoost:
-  - `python train.py --models xgboost`
+  - `python train.py --mode normal --models xgboost`
 
 - Train only CNN baseline:
-  - `python train.py --models cnn`
+  - `python train.py --mode normal --models cnn`
 
 - Train only FusionNet:
-  - `python train.py --models fusionnet`
+  - `python train.py --mode normal --models fusionnet`
 
 - Train only Stacking:
-  - `python train.py --models stacking`
+  - `python train.py --mode normal --models stacking`
 
 - Train multiple selected models:
-  - `python train.py --models xgboost cnn`
-  - `python train.py --models cnn fusionnet`
+  - `python train.py --mode normal --models xgboost cnn`
+  - `python train.py --mode normal --models cnn fusionnet`
+
+### Cross-dataset mode
+- Train selected models with source Apnea-ECG and target MIT-BIH PSG:
+  - `python train.py --mode cross --models xgboost`
+  - `python train.py --mode cross --models all --threshold-metric balanced_accuracy`
+  - `python train.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data`
+
+- Cross-dataset mode currently uses ECG-only inputs for all models.
+- ECG+EDR is still the normal in-dataset setting and is reserved for a later cross-dataset ablation.
+
+- Optional cross-mode flags:
+  - `--apnea-dir` source dataset path (default: `apnea_data`)
+  - `--mit-dir` target dataset path (default: `mitbih_psg_data`)
+  - `--mit-val-size` MIT val split ratio for threshold tuning (default: `0.3`)
+  - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
+  - `--random-state` random seed for MIT val/test split
 
 ### Training dependency behavior
 - `stacking` training automatically trains required dependencies in the same run:
@@ -84,23 +101,41 @@ Run from repo root:
 ## Evaluation CLI (Selective)
 Run from repo root:
 
+### Normal mode (default)
 - Evaluate all:
-  - `python evaluate.py`
+  - `python evaluate.py --mode normal --models all`
+  - or `python evaluate.py --models all`
 
 - Evaluate only XGBoost:
-  - `python evaluate.py --models xgboost`
+  - `python evaluate.py --mode normal --models xgboost`
 
 - Evaluate only CNN baseline:
-  - `python evaluate.py --models cnn`
+  - `python evaluate.py --mode normal --models cnn`
 
 - Evaluate only FusionNet:
-  - `python evaluate.py --models fusionnet`
+  - `python evaluate.py --mode normal --models fusionnet`
 
 - Evaluate only Stacking:
-  - `python evaluate.py --models stacking`
+  - `python evaluate.py --mode normal --models stacking`
 
 - Evaluate multiple selected models:
-  - `python evaluate.py --models xgboost fusionnet`
+  - `python evaluate.py --mode normal --models xgboost fusionnet`
+
+### Cross-dataset mode
+- Evaluate selected models against MIT-BIH val/test with tuned threshold:
+  - `python evaluate.py --mode cross --models xgboost`
+  - `python evaluate.py --mode cross --models all --threshold-metric balanced_accuracy`
+  - `python evaluate.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data`
+
+- Cross-dataset mode currently uses ECG-only inputs for all models.
+- ECG+EDR remains a future cross-dataset ablation, not the implemented baseline.
+
+- Optional cross-mode flags:
+  - `--apnea-dir` source dataset path
+  - `--mit-dir` target dataset path
+  - `--mit-val-size` MIT val split ratio
+  - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
+  - `--random-state` random seed for MIT val/test split
 
 ### Evaluation dependency behavior
 - `stacking` evaluation requires:
@@ -152,11 +187,13 @@ Additional model-specific outputs:
 - CNN:
   - `uncertainty.png`
   - `uncertainty.json`
-  - `saliency_map.png`
+  - `saliency_map_ecg.png`
+  - `saliency_map_edr.png` (normal mode only, because normal mode uses ECG+EDR)
 - FusionNet:
   - `uncertainty.png`
   - `uncertainty.json`
-  - `saliency_map.png`
+  - `saliency_map_ecg.png`
+  - `saliency_map_edr.png` (normal mode only, because normal mode uses ECG+EDR)
 - Stacking:
   - `meta_feature_importance.png`
   - `meta_feature_importance.json`
@@ -166,19 +203,41 @@ Additional model-specific outputs:
   - `uncertainty.png`
   - `uncertainty.json`
 
+Cross-dataset artifacts:
+- all cross-trained model files and evaluation outputs are saved under:
+  - `artifacts/cross-dataset-models/`
+- model files (as trained):
+  - `artifacts/cross-dataset-models/xgb_model.joblib`
+  - `artifacts/cross-dataset-models/cnn_model.pt`
+  - `artifacts/cross-dataset-models/fusion_model.pt`
+  - `artifacts/cross-dataset-models/stacking_model.joblib`
+  - `artifacts/cross-dataset-models/scaler.joblib`
+  - `artifacts/cross-dataset-models/metadata.json`
+- per-model metrics folders:
+  - `artifacts/cross-dataset-models/xgboost/metrics.json`
+  - `artifacts/cross-dataset-models/cnn/metrics.json`
+  - `artifacts/cross-dataset-models/fusionnet/metrics.json`
+  - `artifacts/cross-dataset-models/stacking/metrics.json`
+- aggregate evaluation summary:
+  - `artifacts/cross-dataset-models/evaluation_summary.json`
+
 ## Typical Run Recipes
 ### Full experiment from scratch
 1. `python download_dataset.py`
-2. `python train.py --models all`
-3. `python evaluate.py --models all`
+2. `python train.py --mode normal --models all`
+3. `python evaluate.py --mode normal --models all`
+
+### Cross-dataset experiment
+1. `python train.py --mode cross --models all --threshold-metric balanced_accuracy`
+2. `python evaluate.py --mode cross --models all --threshold-metric balanced_accuracy`
 
 ### Fast iteration on one model
-1. Train one model, e.g. `python train.py --models cnn`
-2. Evaluate one model, e.g. `python evaluate.py --models cnn`
+1. Train one model, e.g. `python train.py --mode normal --models cnn`
+2. Evaluate one model, e.g. `python evaluate.py --mode normal --models cnn`
 
 ### Recompute only stacking
-1. `python train.py --models stacking`
-2. `python evaluate.py --models stacking`
+1. `python train.py --mode normal --models stacking`
+2. `python evaluate.py --mode normal --models stacking`
 
 ## Important Notes to Remember
 1. `test_data.py` now just launches `train.py` for backward compatibility.
@@ -188,6 +247,7 @@ Additional model-specific outputs:
 5. MC dropout is used directly for CNN and FusionNet uncertainty; tree models do not use MC dropout directly.
 6. For stacking uncertainty, FusionNet MC-dropout samples are propagated through the stacking model.
 7. SHAP outputs are optional and are skipped automatically if SHAP is not installed.
+8. Cross-dataset runs always write outputs under `artifacts/cross-dataset-models/`.
 
 ## Paper-Oriented Reporting Pointers
 1. Use identical test split across all models (already enforced via saved indices).

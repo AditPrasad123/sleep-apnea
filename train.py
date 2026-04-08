@@ -3,9 +3,11 @@ import argparse
 import joblib
 import numpy as np
 import torch
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from pipeline import (
+    CROSS_ARTIFACT_DIR,
     DATA_DIR,
     FEATURE_NAMES,
     RANDOM_STATE,
@@ -18,13 +20,18 @@ from pipeline import (
     build_ecg_edr_signal,
     build_feature_matrix,
     build_train_test_split,
+    cross_artifact_path,
     compute_class_weights,
     ensure_artifact_dir,
+    load_apnea_ecg_segments_30s,
+    load_mitbih_psg_segments_30s,
     load_segments_and_labels,
     predict_probs,
     predict_probs_signal,
     save_array,
     save_json,
+    summarize_split,
+    tune_cross_threshold,
     train_cnn_baseline,
     train_fusion_model,
     train_stacking,
@@ -35,11 +42,37 @@ from pipeline import (
 def parse_args():
     parser = argparse.ArgumentParser(description="Train sleep apnea models selectively.")
     parser.add_argument(
+        "--mode",
+        choices=["normal", "cross"],
+        default="normal",
+        help="Training mode. normal = Apnea-ECG train/test split, cross = train on Apnea-ECG and validate on MIT-BIH PSG.",
+    )
+    parser.add_argument(
         "--models",
         nargs="+",
         choices=["all", "xgboost", "cnn", "fusionnet", "stacking"],
         default=["all"],
         help="Models to train. Use one or more: xgboost cnn fusionnet stacking. Default: all",
+    )
+    parser.add_argument("--apnea-dir", default=DATA_DIR, help="Path to Apnea-ECG directory.")
+    parser.add_argument("--mit-dir", default="mitbih_psg_data", help="Path to MIT-BIH PSG directory.")
+    parser.add_argument(
+        "--mit-val-size",
+        type=float,
+        default=0.3,
+        help="Validation split ratio within MIT-BIH PSG for cross-dataset threshold tuning.",
+    )
+    parser.add_argument(
+        "--threshold-metric",
+        choices=["f1", "balanced_accuracy", "mcc"],
+        default="f1",
+        help="Metric used for threshold tuning during cross-dataset evaluation.",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=RANDOM_STATE,
+        help="Random seed for cross-dataset MIT val/test split.",
     )
     return parser.parse_args()
 
@@ -50,32 +83,36 @@ def resolve_requested_models(raw_models):
     return set(raw_models)
 
 
-def save_common_artifacts(scaler, train_idx, test_idx, feature_dim):
-    ensure_artifact_dir()
-    joblib.dump(scaler, artifact_path("scaler.joblib"))
-    save_array("train_idx.npy", train_idx)
-    save_array("test_idx.npy", test_idx)
-    save_json(
-        {
-            "data_dir": DATA_DIR,
-            "fs": FS,
-            "window_seconds": WINDOW_SECONDS,
-            "stride_seconds": STRIDE_SECONDS,
-            "test_size": TEST_SIZE,
-            "random_state": RANDOM_STATE,
-            "feature_dim": int(feature_dim),
-            "feature_names": FEATURE_NAMES,
-            "signal_channels": SIGNAL_CHANNELS,
-            "signal_streams": ["ecg", "edr"],
-        },
-        "metadata.json",
-    )
+def save_common_artifacts(scaler, train_idx, test_idx, feature_dim, artifact_dir=None):
+    base_dir = artifact_dir
+    ensure_artifact_dir(base_dir=base_dir) if base_dir else ensure_artifact_dir()
+    if base_dir:
+        joblib.dump(scaler, artifact_path("scaler.joblib", base_dir=base_dir))
+        save_array("train_idx.npy", train_idx, base_dir=base_dir)
+        save_array("test_idx.npy", test_idx, base_dir=base_dir)
+    else:
+        joblib.dump(scaler, artifact_path("scaler.joblib"))
+        save_array("train_idx.npy", train_idx)
+        save_array("test_idx.npy", test_idx)
+    payload = {
+        "data_dir": DATA_DIR,
+        "fs": FS,
+        "window_seconds": WINDOW_SECONDS,
+        "stride_seconds": STRIDE_SECONDS,
+        "test_size": TEST_SIZE,
+        "random_state": RANDOM_STATE,
+        "feature_dim": int(feature_dim),
+        "feature_names": FEATURE_NAMES,
+        "signal_channels": SIGNAL_CHANNELS,
+        "signal_streams": ["ecg", "edr"],
+    }
+    if base_dir:
+        save_json(payload, "metadata.json", base_dir=base_dir)
+    else:
+        save_json(payload, "metadata.json")
 
 
-def main():
-    args = parse_args()
-    requested = resolve_requested_models(args.models)
-
+def run_normal_training(requested):
     print("=== Stage 1: Loading and Segmenting ECG Data ===")
     x_signal, y = load_segments_and_labels(DATA_DIR)
 
@@ -175,6 +212,150 @@ def main():
         print("Saved stacking artifacts.")
 
     print("Saved/updated model artifacts in artifacts/")
+
+
+def run_cross_training(args, requested):
+    print("=== Cross-Dataset Training: Loading Source and Target Data ===")
+    x_train_sig, y_train = load_apnea_ecg_segments_30s(args.apnea_dir, fs=FS)
+    x_target_sig, y_target = load_mitbih_psg_segments_30s(args.mit_dir, target_fs=FS)
+
+    x_val_sig, x_test_sig, y_val, y_test = train_test_split(
+        x_target_sig,
+        y_target,
+        test_size=1.0 - args.mit_val_size,
+        random_state=args.random_state,
+        stratify=y_target,
+    )
+
+    summarize_split("Apnea-ECG train", y_train)
+    summarize_split("MIT-BIH PSG val", y_val)
+    summarize_split("MIT-BIH PSG test", y_test)
+
+    ensure_artifact_dir(base_dir=CROSS_ARTIFACT_DIR)
+
+    if len(x_train_sig) == 0 or len(x_val_sig) == 0 or len(x_test_sig) == 0:
+        raise RuntimeError("Empty split after preprocessing. Check paths and preprocessing filters.")
+
+    x_train_feat_raw = build_feature_matrix(x_train_sig)
+    x_val_feat_raw = build_feature_matrix(x_val_sig)
+
+    scaler = StandardScaler()
+    x_train_feat = scaler.fit_transform(x_train_feat_raw)
+    x_val_feat = scaler.transform(x_val_feat_raw)
+
+    joblib.dump(scaler, cross_artifact_path("scaler.joblib"))
+
+    x_train_sig_n = x_train_sig[..., np.newaxis]
+    x_val_sig_n = x_val_sig[..., np.newaxis]
+
+    scale, pos_weight = compute_class_weights(y_train)
+
+    xgb_train_prob = None
+    xgb_val_prob = None
+    fusion_train_prob = None
+    fusion_val_prob = None
+
+    if "xgboost" in requested or "stacking" in requested:
+        print("=== Cross Stage 1: Training XGBoost ===")
+        xgb_model, xgb_train_prob, xgb_val_prob = train_xgboost(
+            x_train_feat,
+            y_train,
+            x_val_feat,
+            y_val,
+            scale,
+        )
+        joblib.dump(xgb_model, cross_artifact_path("xgb_model.joblib"))
+
+    if "cnn" in requested:
+        print("=== Cross Stage 2: Training CNN ===")
+        cnn_model = train_cnn_baseline(
+            x_train_sig_n,
+            x_val_sig_n,
+            y_train,
+            y_val,
+            pos_weight,
+            input_channels=1,
+        )
+        torch.save(cnn_model.state_dict(), cross_artifact_path("cnn_model.pt"))
+
+    if "fusionnet" in requested or "stacking" in requested:
+        print("=== Cross Stage 3: Training FusionNet ===")
+        fusion_model = train_fusion_model(
+            x_train_sig_n,
+            x_val_sig_n,
+            x_train_feat,
+            x_val_feat,
+            y_train,
+            y_val,
+            pos_weight,
+            feature_dim=x_train_feat.shape[1],
+            input_channels=1,
+        )
+        fusion_train_prob = predict_probs(fusion_model, x_train_sig_n, x_train_feat)
+        fusion_val_prob = predict_probs(fusion_model, x_val_sig_n, x_val_feat)
+        torch.save(fusion_model.state_dict(), cross_artifact_path("fusion_model.pt"))
+
+    if "stacking" in requested:
+        print("=== Cross Stage 4: Training Stacking Meta Model ===")
+        meta_model = train_stacking(
+            xgb_train_prob,
+            xgb_val_prob,
+            fusion_train_prob,
+            fusion_val_prob,
+            y_train,
+            y_val,
+        )
+        joblib.dump(meta_model, cross_artifact_path("stacking_model.joblib"))
+
+    threshold_info = {}
+    if xgb_val_prob is not None:
+        threshold, score = tune_cross_threshold(y_val, xgb_val_prob, args.threshold_metric)
+        threshold_info["xgboost"] = {
+            "metric": args.threshold_metric,
+            "threshold": threshold,
+            "val_score": score,
+        }
+    if fusion_val_prob is not None:
+        threshold, score = tune_cross_threshold(y_val, fusion_val_prob, args.threshold_metric)
+        threshold_info["fusionnet"] = {
+            "metric": args.threshold_metric,
+            "threshold": threshold,
+            "val_score": score,
+        }
+
+    save_json(
+        {
+            "mode": "cross",
+            "artifact_dir": CROSS_ARTIFACT_DIR,
+            "fs": FS,
+            "apnea_dir": args.apnea_dir,
+            "mit_dir": args.mit_dir,
+            "mit_val_size": args.mit_val_size,
+            "random_state": args.random_state,
+            "threshold_metric": args.threshold_metric,
+            "feature_dim": int(x_train_feat.shape[1]),
+            "feature_names": FEATURE_NAMES,
+            "signal_channels": 1,
+            "source_train_size": int(len(y_train)),
+            "target_val_size": int(len(y_val)),
+            "target_test_size": int(len(y_test)),
+            "trained_models": sorted(list(requested)),
+            "precomputed_thresholds": threshold_info,
+        },
+        "metadata.json",
+        base_dir=CROSS_ARTIFACT_DIR,
+    )
+    print("Saved/updated cross-dataset model artifacts in artifacts/cross-dataset-models/")
+
+
+def main():
+    args = parse_args()
+    requested = resolve_requested_models(args.models)
+
+    if args.mode == "normal":
+        run_normal_training(requested)
+    else:
+        run_cross_training(args, requested)
 
 
 if __name__ == "__main__":
