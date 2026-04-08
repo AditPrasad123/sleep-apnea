@@ -1,3 +1,5 @@
 apnea_data/
+mitbih_psg_data/
 *__pycache__*
 artifacts/
+CROSS_DATASET_PLAN.md
