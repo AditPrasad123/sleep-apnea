@@ -31,6 +31,18 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 3. FusionNet: CNN + BiLSTM on ECG+EDR signal + dense feature branch
 4. Stacking: XGBoost + FusionNet probabilities into XGBoost meta-model
 
+## Model Inputs At A Glance
+1. XGBoost uses handcrafted features only.
+2. CNN uses raw signal windows only.
+3. FusionNet uses two inputs:
+  - signal stream: ECG or ECG+EDR, depending on mode
+  - feature stream: handcrafted features from the same window
+  The two learned embeddings are concatenated before the final classifier.
+4. Stacking uses model probabilities only:
+  - XGBoost probability
+  - FusionNet probability
+  These are fused in a meta XGBoost model.
+
 ## Explainability + Uncertainty
 ### XGBoost
 - Feature importance plot and JSON are generated during evaluation.
@@ -78,16 +90,18 @@ Run from repo root:
 
 ### Cross-dataset mode
 - Train selected models with source Apnea-ECG and target MIT-BIH PSG:
-  - `python train.py --mode cross --models xgboost`
-  - `python train.py --mode cross --models all --threshold-metric balanced_accuracy`
-  - `python train.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data`
+  - `python train.py --mode cross --models xgboost --cross-signal-mode ecg`
+  - `python train.py --mode cross --models all --cross-signal-mode ecg_edr --threshold-metric balanced_accuracy`
+  - `python train.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data --cross-signal-mode ecg_edr`
 
-- Cross-dataset mode currently uses ECG-only inputs for all models.
-- ECG+EDR is still the normal in-dataset setting and is reserved for a later cross-dataset ablation.
+- Cross-dataset mode now supports both:
+  - `ecg` (1-channel baseline)
+  - `ecg_edr` (2-channel ECG+EDR)
 
 - Optional cross-mode flags:
   - `--apnea-dir` source dataset path (default: `apnea_data`)
   - `--mit-dir` target dataset path (default: `mitbih_psg_data`)
+  - `--cross-signal-mode` one of `ecg` or `ecg_edr` (default: `ecg`)
   - `--mit-val-size` MIT val split ratio for threshold tuning (default: `0.3`)
   - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
   - `--random-state` random seed for MIT val/test split
@@ -123,12 +137,12 @@ Run from repo root:
 
 ### Cross-dataset mode
 - Evaluate selected models against MIT-BIH val/test with tuned threshold:
-  - `python evaluate.py --mode cross --models xgboost`
+  - `python evaluate.py --mode cross --models xgboost --cross-signal-mode ecg`
   - `python evaluate.py --mode cross --models all --threshold-metric balanced_accuracy`
   - `python evaluate.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data`
+  - `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr`
 
-- Cross-dataset mode currently uses ECG-only inputs for all models.
-- ECG+EDR remains a future cross-dataset ablation, not the implemented baseline.
+- Cross evaluation defaults to `--cross-signal-mode ecg`.
 
 - Optional cross-mode flags:
   - `--apnea-dir` source dataset path
@@ -204,22 +218,23 @@ Additional model-specific outputs:
   - `uncertainty.json`
 
 Cross-dataset artifacts:
-- all cross-trained model files and evaluation outputs are saved under:
-  - `artifacts/cross-dataset-models/`
+- cross-trained model files and evaluation outputs are saved under mode-specific folders:
+  - `artifacts/cross-dataset-models/ecg/`
+  - `artifacts/cross-dataset-models/ecg_edr/`
 - model files (as trained):
-  - `artifacts/cross-dataset-models/xgb_model.joblib`
-  - `artifacts/cross-dataset-models/cnn_model.pt`
-  - `artifacts/cross-dataset-models/fusion_model.pt`
-  - `artifacts/cross-dataset-models/stacking_model.joblib`
-  - `artifacts/cross-dataset-models/scaler.joblib`
-  - `artifacts/cross-dataset-models/metadata.json`
+  - `artifacts/cross-dataset-models/<mode>/xgb_model.joblib`
+  - `artifacts/cross-dataset-models/<mode>/cnn_model.pt`
+  - `artifacts/cross-dataset-models/<mode>/fusion_model.pt`
+  - `artifacts/cross-dataset-models/<mode>/stacking_model.joblib`
+  - `artifacts/cross-dataset-models/<mode>/scaler.joblib`
+  - `artifacts/cross-dataset-models/<mode>/metadata.json`
 - per-model metrics folders:
-  - `artifacts/cross-dataset-models/xgboost/metrics.json`
-  - `artifacts/cross-dataset-models/cnn/metrics.json`
-  - `artifacts/cross-dataset-models/fusionnet/metrics.json`
-  - `artifacts/cross-dataset-models/stacking/metrics.json`
+  - `artifacts/cross-dataset-models/<mode>/xgboost/metrics.json`
+  - `artifacts/cross-dataset-models/<mode>/cnn/metrics.json`
+  - `artifacts/cross-dataset-models/<mode>/fusionnet/metrics.json`
+  - `artifacts/cross-dataset-models/<mode>/stacking/metrics.json`
 - aggregate evaluation summary:
-  - `artifacts/cross-dataset-models/evaluation_summary.json`
+  - `artifacts/cross-dataset-models/<mode>/evaluation_summary.json`
 
 ## Typical Run Recipes
 ### Full experiment from scratch
@@ -228,8 +243,10 @@ Cross-dataset artifacts:
 3. `python evaluate.py --mode normal --models all`
 
 ### Cross-dataset experiment
-1. `python train.py --mode cross --models all --threshold-metric balanced_accuracy`
-2. `python evaluate.py --mode cross --models all --threshold-metric balanced_accuracy`
+1. `python train.py --mode cross --models all --cross-signal-mode ecg --threshold-metric balanced_accuracy`
+2. `python evaluate.py --mode cross --models all --cross-signal-mode ecg --threshold-metric balanced_accuracy`
+3. Optional ECG+EDR run: `python train.py --mode cross --models all --cross-signal-mode ecg_edr --threshold-metric balanced_accuracy`
+4. Optional ECG+EDR eval: `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --threshold-metric balanced_accuracy`
 
 ### Fast iteration on one model
 1. Train one model, e.g. `python train.py --mode normal --models cnn`
@@ -247,7 +264,7 @@ Cross-dataset artifacts:
 5. MC dropout is used directly for CNN and FusionNet uncertainty; tree models do not use MC dropout directly.
 6. For stacking uncertainty, FusionNet MC-dropout samples are propagated through the stacking model.
 7. SHAP outputs are optional and are skipped automatically if SHAP is not installed.
-8. Cross-dataset runs always write outputs under `artifacts/cross-dataset-models/`.
+8. Cross-dataset runs write outputs under `artifacts/cross-dataset-models/<mode>/`.
 
 ## Paper-Oriented Reporting Pointers
 1. Use identical test split across all models (already enforced via saved indices).

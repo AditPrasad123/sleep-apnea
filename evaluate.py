@@ -32,7 +32,6 @@ from pipeline import (
     compute_cross_metrics,
     compute_signal_saliency,
     compute_signal_saliency_signal_only,
-    cross_artifact_path,
     load_apnea_ecg_segments_30s,
     load_array,
     load_json,
@@ -82,7 +81,17 @@ def parse_args():
         default=42,
         help="Random seed for cross-dataset MIT val/test split.",
     )
+    parser.add_argument(
+        "--cross-signal-mode",
+        choices=["ecg", "ecg_edr"],
+        default="ecg",
+        help="Cross mode signal input (ecg or ecg_edr). Default: ecg.",
+    )
     return parser.parse_args()
+
+
+def cross_run_dir(signal_mode):
+    return os.path.join(CROSS_ARTIFACT_DIR, signal_mode)
 
 
 def resolve_requested_models(raw_models):
@@ -385,8 +394,8 @@ def save_saliency_plots(model_dir, signal_sample_tc, saliency_ct, probability, f
         plt.close(fig)
 
 
-def save_cross_metrics(model_label, val_metric_name, tuned_threshold, best_val_score, test_metrics):
-    model_dir = ensure_model_dir(model_label, base_dir=CROSS_ARTIFACT_DIR)
+def save_cross_metrics(model_label, val_metric_name, tuned_threshold, best_val_score, test_metrics, base_dir):
+    model_dir = ensure_model_dir(model_label, base_dir=base_dir)
     payload = {
         "mode": "cross",
         "threshold_metric": val_metric_name,
@@ -413,7 +422,8 @@ def report_cross_metrics(model_label, threshold_metric, tuned_threshold, best_va
 
 
 def evaluate_cross_mode(args, requested):
-    metadata = load_json("metadata.json", base_dir=CROSS_ARTIFACT_DIR)
+    run_dir = cross_run_dir(args.cross_signal_mode)
+    metadata = load_json("metadata.json", base_dir=run_dir)
     cross_fs = int(metadata.get("fs", FS))
 
     apnea_dir = args.apnea_dir if args.apnea_dir else metadata.get("apnea_dir", DATA_DIR)
@@ -437,12 +447,23 @@ def evaluate_cross_mode(args, requested):
     summarize_split("MIT-BIH PSG val", y_val)
     summarize_split("MIT-BIH PSG test", y_test)
 
-    scaler = joblib.load(cross_artifact_path("scaler.joblib"))
+    scaler = joblib.load(artifact_path("scaler.joblib", base_dir=run_dir))
     x_val_feat = scaler.transform(build_feature_matrix(x_val_sig))
     x_test_feat = scaler.transform(build_feature_matrix(x_test_sig))
 
-    x_val_sig_n = x_val_sig[..., np.newaxis]
-    x_test_sig_n = x_test_sig[..., np.newaxis]
+    metadata_signal_mode = metadata.get("cross_signal_mode")
+    if metadata_signal_mode is None:
+        metadata_signal_mode = "ecg_edr" if int(metadata.get("signal_channels", 1)) >= 2 else "ecg"
+
+    requested_signal_mode = args.cross_signal_mode if args.cross_signal_mode else metadata_signal_mode
+    if requested_signal_mode == "ecg_edr":
+        x_val_sig_n = build_ecg_edr_signal(x_val_sig, fs=cross_fs)
+        x_test_sig_n = build_ecg_edr_signal(x_test_sig, fs=cross_fs)
+    else:
+        x_val_sig_n = x_val_sig[..., np.newaxis]
+        x_test_sig_n = x_test_sig[..., np.newaxis]
+
+    signal_channels = int(metadata.get("signal_channels", x_val_sig_n.shape[2]))
 
     threshold_metric = args.threshold_metric or metadata.get("threshold_metric", "f1")
     summary = {}
@@ -453,7 +474,7 @@ def evaluate_cross_mode(args, requested):
     fusion_test_prob = None
 
     if "xgboost" in requested or "stacking" in requested:
-        xgb_model = joblib.load(cross_artifact_path("xgb_model.joblib"))
+        xgb_model = joblib.load(artifact_path("xgb_model.joblib", base_dir=run_dir))
         xgb_val_prob = xgb_model.predict_proba(x_val_feat)[:, 1]
         xgb_test_prob = xgb_model.predict_proba(x_test_feat)[:, 1]
 
@@ -461,9 +482,9 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, xgb_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, xgb_test_prob, threshold=tuned_threshold)
         report_cross_metrics("XGBoost", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("XGBoost", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        xgb_model_dir = ensure_model_dir("XGBoost", base_dir=CROSS_ARTIFACT_DIR)
-        save_model_outputs("XGBoost", y_test, xgb_test_prob, (xgb_test_prob >= tuned_threshold).astype(int), base_dir=CROSS_ARTIFACT_DIR)
+        save_cross_metrics("XGBoost", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        xgb_model_dir = ensure_model_dir("XGBoost", base_dir=run_dir)
+        save_model_outputs("XGBoost", y_test, xgb_test_prob, (xgb_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         feature_names = metadata.get(
             "feature_names",
             [f"feature_{index}" for index in range(len(xgb_model.feature_importances_))],
@@ -481,17 +502,17 @@ def evaluate_cross_mode(args, requested):
         }
 
     if "cnn" in requested:
-        cnn_model = CNNBaseline(input_channels=1).to(DEVICE)
-        cnn_model.load_state_dict(torch.load(cross_artifact_path("cnn_model.pt"), map_location=DEVICE))
+        cnn_model = CNNBaseline(input_channels=signal_channels).to(DEVICE)
+        cnn_model.load_state_dict(torch.load(artifact_path("cnn_model.pt", base_dir=run_dir), map_location=DEVICE))
         cnn_model.eval()
         cnn_val_prob = predict_probs_signal(cnn_model, x_val_sig_n)
         cnn_test_prob = predict_probs_signal(cnn_model, x_test_sig_n)
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, cnn_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, cnn_test_prob, threshold=tuned_threshold)
         report_cross_metrics("CNN", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("CNN", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        cnn_model_dir = ensure_model_dir("CNN", base_dir=CROSS_ARTIFACT_DIR)
-        save_model_outputs("CNN", y_test, cnn_test_prob, (cnn_test_prob >= tuned_threshold).astype(int), base_dir=CROSS_ARTIFACT_DIR)
+        save_cross_metrics("CNN", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        cnn_model_dir = ensure_model_dir("CNN", base_dir=run_dir)
+        save_model_outputs("CNN", y_test, cnn_test_prob, (cnn_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         _, cnn_test_uncertainty, _ = predict_probs_signal_mc_dropout(cnn_model, x_test_sig_n)
         save_uncertainty_outputs(cnn_model_dir, cnn_test_prob, cnn_test_uncertainty)
 
@@ -514,8 +535,8 @@ def evaluate_cross_mode(args, requested):
         }
 
     if "fusionnet" in requested or "stacking" in requested:
-        fusion_model = FusionNet(feature_dim=int(metadata["feature_dim"]), input_channels=1).to(DEVICE)
-        fusion_model.load_state_dict(torch.load(cross_artifact_path("fusion_model.pt"), map_location=DEVICE))
+        fusion_model = FusionNet(feature_dim=int(metadata["feature_dim"]), input_channels=signal_channels).to(DEVICE)
+        fusion_model.load_state_dict(torch.load(artifact_path("fusion_model.pt", base_dir=run_dir), map_location=DEVICE))
         fusion_model.eval()
         fusion_val_prob = predict_probs(fusion_model, x_val_sig_n, x_val_feat)
         fusion_test_prob = predict_probs(fusion_model, x_test_sig_n, x_test_feat)
@@ -529,9 +550,9 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, fusion_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, fusion_test_prob, threshold=tuned_threshold)
         report_cross_metrics("FusionNet", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("FusionNet", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        fusion_model_dir = ensure_model_dir("FusionNet", base_dir=CROSS_ARTIFACT_DIR)
-        save_model_outputs("FusionNet", y_test, fusion_test_prob, (fusion_test_prob >= tuned_threshold).astype(int), base_dir=CROSS_ARTIFACT_DIR)
+        save_cross_metrics("FusionNet", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        fusion_model_dir = ensure_model_dir("FusionNet", base_dir=run_dir)
+        save_model_outputs("FusionNet", y_test, fusion_test_prob, (fusion_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         save_uncertainty_outputs(fusion_model_dir, fusion_test_prob, fusion_test_uncertainty)
 
         fusion_uncertain_index = int(np.argmax(fusion_test_uncertainty))
@@ -554,7 +575,7 @@ def evaluate_cross_mode(args, requested):
         }
 
     if "stacking" in requested:
-        meta_model = joblib.load(cross_artifact_path("stacking_model.joblib"))
+        meta_model = joblib.load(artifact_path("stacking_model.joblib", base_dir=run_dir))
         meta_val = np.column_stack([xgb_val_prob, fusion_val_prob])
         meta_test = np.column_stack([xgb_test_prob, fusion_test_prob])
         meta_val_prob = meta_model.predict_proba(meta_val)[:, 1]
@@ -562,9 +583,9 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, meta_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, meta_test_prob, threshold=tuned_threshold)
         report_cross_metrics("Stacking", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("Stacking", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        stacking_dir = ensure_model_dir("Stacking", base_dir=CROSS_ARTIFACT_DIR)
-        save_model_outputs("Stacking", y_test, meta_test_prob, (meta_test_prob >= tuned_threshold).astype(int), base_dir=CROSS_ARTIFACT_DIR)
+        save_cross_metrics("Stacking", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        stacking_dir = ensure_model_dir("Stacking", base_dir=run_dir)
+        save_model_outputs("Stacking", y_test, meta_test_prob, (meta_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         save_stacking_explainability(stacking_dir, meta_model)
 
         meta_feature_names = ["xgboost_prob", "fusionnet_prob"]
@@ -584,10 +605,10 @@ def evaluate_cross_mode(args, requested):
             **test_metrics,
         }
 
-    with open(cross_artifact_path("evaluation_summary.json"), "w", encoding="utf-8") as handle:
+    with open(artifact_path("evaluation_summary.json", base_dir=run_dir), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
-    print("Saved cross-dataset metrics in artifacts/cross-dataset-models/")
+    print(f"Saved cross-dataset metrics in {run_dir}/")
 
 
 def main():
