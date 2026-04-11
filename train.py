@@ -80,6 +80,17 @@ def parse_args():
         default="ecg",
         help="Cross mode signal input for CNN/FusionNet/Stacking: ecg (1-channel) or ecg_edr (2-channel).",
     )
+    parser.add_argument(
+        "--cross-harmonize-level",
+        choices=["none", "light", "full"],
+        default="light",
+        help="Cross preprocessing harmonization level. Default: light.",
+    )
+    parser.add_argument(
+        "--no-cross-harmonize",
+        action="store_true",
+        help="Shortcut to set cross harmonization level to none.",
+    )
     return parser.parse_args()
 
 
@@ -226,8 +237,9 @@ def run_normal_training(requested):
 
 def run_cross_training(args, requested):
     print("=== Cross-Dataset Training: Loading Source and Target Data ===")
-    x_train_sig, y_train = load_apnea_ecg_segments_30s(args.apnea_dir, fs=FS)
-    x_target_sig, y_target = load_mitbih_psg_segments_30s(args.mit_dir, target_fs=FS)
+    harmonize_level = "none" if args.no_cross_harmonize else args.cross_harmonize_level
+    x_train_sig, y_train = load_apnea_ecg_segments_30s(args.apnea_dir, fs=FS, harmonize_level=harmonize_level)
+    x_target_sig, y_target = load_mitbih_psg_segments_30s(args.mit_dir, target_fs=FS, harmonize_level=harmonize_level)
 
     x_val_sig, x_test_sig, y_val, y_test = train_test_split(
         x_target_sig,
@@ -352,6 +364,8 @@ def run_cross_training(args, requested):
             "mit_val_size": args.mit_val_size,
             "random_state": args.random_state,
             "threshold_metric": args.threshold_metric,
+            "harmonize_preprocessing": harmonize_level != "none",
+            "cross_harmonize_level": harmonize_level,
             "cross_signal_mode": args.cross_signal_mode,
             "feature_dim": int(x_train_feat.shape[1]),
             "feature_names": FEATURE_NAMES,

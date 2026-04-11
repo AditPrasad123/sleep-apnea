@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import wfdb
-from scipy.signal import find_peaks, resample_poly
+from scipy.signal import butter, find_peaks, filtfilt, resample_poly
 from scipy.stats import kurtosis, skew
 from sklearn.metrics import (
     accuracy_score,
@@ -33,7 +33,7 @@ WINDOW_SECONDS = 30
 STRIDE_SECONDS = 10
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
-EPOCHS = 20
+EPOCHS = 30
 TRAIN_BATCH_SIZE = 32
 EVAL_BATCH_SIZE = 64
 MC_DROPOUT_PASSES = 25
@@ -246,7 +246,81 @@ def resample_to_target(segment, original_fs, target_fs=FS):
     return np.asarray(resampled, dtype=np.float32)
 
 
-def load_apnea_ecg_segments_30s(data_dir=DATA_DIR, fs=FS):
+def bandpass_filter_segment(segment, fs=FS, lowcut=0.5, highcut=40.0, order=4):
+    segment = np.asarray(segment, dtype=np.float32)
+    if len(segment) < max(10, order * 6):
+        return segment
+
+    nyquist = 0.5 * fs
+    low = max(lowcut / nyquist, 1e-4)
+    high = min(highcut / nyquist, 0.999)
+    if low >= high:
+        return segment
+
+    b, a = butter(order, [low, high], btype="band")
+    return filtfilt(b, a, segment).astype(np.float32)
+
+
+def harmonize_ecg_segment_full(segment, fs=FS, lowcut=0.5, highcut=40.0, clip_percentiles=(1.0, 99.0), z_clip=5.0):
+    segment = np.nan_to_num(np.asarray(segment, dtype=np.float32))
+    if segment.size == 0:
+        return None
+
+    segment = bandpass_filter_segment(segment, fs=fs, lowcut=lowcut, highcut=highcut)
+
+    if clip_percentiles is not None:
+        low_p, high_p = np.percentile(segment, clip_percentiles)
+        segment = np.clip(segment, low_p, high_p)
+
+    mean = np.mean(segment)
+    std = np.std(segment)
+    if std <= 0:
+        return None
+
+    segment = (segment - mean) / (std + 1e-8)
+    if z_clip is not None:
+        segment = np.clip(segment, -z_clip, z_clip)
+
+    if np.any(np.isnan(segment)) or np.any(np.isinf(segment)):
+        return None
+
+    return np.asarray(segment, dtype=np.float32)
+
+
+def harmonize_ecg_segment_light(segment, clip_percentiles=(0.5, 99.5), z_clip=None):
+    segment = np.nan_to_num(np.asarray(segment, dtype=np.float32))
+    if segment.size == 0:
+        return None
+
+    if clip_percentiles is not None:
+        low_p, high_p = np.percentile(segment, clip_percentiles)
+        segment = np.clip(segment, low_p, high_p)
+
+    std = np.std(segment)
+    if std <= 0:
+        return None
+
+    segment = (segment - np.mean(segment)) / (std + 1e-8)
+    if z_clip is not None:
+        segment = np.clip(segment, -z_clip, z_clip)
+
+    if np.any(np.isnan(segment)) or np.any(np.isinf(segment)):
+        return None
+
+    return np.asarray(segment, dtype=np.float32)
+
+
+def preprocess_ecg_segment(segment, fs=FS, harmonize_level="none"):
+    if harmonize_level == "none":
+        return normalize_segment(segment)
+    if harmonize_level == "light":
+        return harmonize_ecg_segment_light(segment)
+    if harmonize_level == "full":
+        return harmonize_ecg_segment_full(segment, fs=fs)
+    raise ValueError(f"Unsupported harmonize_level: {harmonize_level}")
+
+
+def load_apnea_ecg_segments_30s(data_dir=DATA_DIR, fs=FS, harmonize_level="none"):
     window = fs * 30
     minute = fs * 60
 
@@ -271,7 +345,7 @@ def load_apnea_ecg_segments_30s(data_dir=DATA_DIR, fs=FS):
             if minute_idx >= len(minute_labels):
                 continue
 
-            segment = normalize_segment(signal[start:end])
+            segment = preprocess_ecg_segment(signal[start:end], fs=fs, harmonize_level=harmonize_level)
             if segment is None:
                 continue
 
@@ -282,7 +356,7 @@ def load_apnea_ecg_segments_30s(data_dir=DATA_DIR, fs=FS):
     return np.array(segments, dtype=np.float32), np.array(labels, dtype=np.int64)
 
 
-def load_mitbih_psg_segments_30s(data_dir="mitbih_psg_data", target_fs=FS):
+def load_mitbih_psg_segments_30s(data_dir="mitbih_psg_data", target_fs=FS, harmonize_level="none"):
     segments = []
     labels = []
 
@@ -308,7 +382,7 @@ def load_mitbih_psg_segments_30s(data_dir="mitbih_psg_data", target_fs=FS):
 
             raw_segment = ecg[start:end]
             resampled = resample_to_target(raw_segment, original_fs=record_fs, target_fs=target_fs)
-            segment = normalize_segment(resampled)
+            segment = preprocess_ecg_segment(resampled, fs=target_fs, harmonize_level=harmonize_level)
             if segment is None:
                 continue
 

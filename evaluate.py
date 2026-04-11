@@ -87,6 +87,17 @@ def parse_args():
         default="ecg",
         help="Cross mode signal input (ecg or ecg_edr). Default: ecg.",
     )
+    parser.add_argument(
+        "--cross-harmonize-level",
+        choices=["none", "light", "full"],
+        default=None,
+        help="Optional harmonization level override for cross evaluation. Default uses run metadata.",
+    )
+    parser.add_argument(
+        "--no-cross-harmonize",
+        action="store_true",
+        help="Shortcut to set cross harmonization level to none.",
+    )
     return parser.parse_args()
 
 
@@ -394,13 +405,15 @@ def save_saliency_plots(model_dir, signal_sample_tc, saliency_ct, probability, f
         plt.close(fig)
 
 
-def save_cross_metrics(model_label, val_metric_name, tuned_threshold, best_val_score, test_metrics, base_dir):
+def save_cross_metrics(model_label, val_metric_name, tuned_threshold, best_val_score, test_metrics, base_dir, harmonize_level):
     model_dir = ensure_model_dir(model_label, base_dir=base_dir)
     payload = {
         "mode": "cross",
         "threshold_metric": val_metric_name,
         "tuned_threshold": float(tuned_threshold),
         "val_score": float(best_val_score),
+        "harmonize_preprocessing": harmonize_level != "none",
+        "cross_harmonize_level": harmonize_level,
         "test_metrics": test_metrics,
     }
     with open(os.path.join(model_dir, "metrics.json"), "w", encoding="utf-8") as handle:
@@ -425,6 +438,15 @@ def evaluate_cross_mode(args, requested):
     run_dir = cross_run_dir(args.cross_signal_mode)
     metadata = load_json("metadata.json", base_dir=run_dir)
     cross_fs = int(metadata.get("fs", FS))
+    if args.no_cross_harmonize:
+        harmonize_level = "none"
+    elif args.cross_harmonize_level is not None:
+        harmonize_level = args.cross_harmonize_level
+    else:
+        if "cross_harmonize_level" in metadata:
+            harmonize_level = metadata.get("cross_harmonize_level", "light")
+        else:
+            harmonize_level = "full" if bool(metadata.get("harmonize_preprocessing", True)) else "none"
 
     apnea_dir = args.apnea_dir if args.apnea_dir else metadata.get("apnea_dir", DATA_DIR)
     mit_dir = args.mit_dir if args.mit_dir else metadata.get("mit_dir", "mitbih_psg_data")
@@ -432,8 +454,8 @@ def evaluate_cross_mode(args, requested):
     random_state = args.random_state if args.random_state is not None else metadata.get("random_state", 42)
 
     print("=== Loading Cross-Dataset Evaluation Data ===")
-    x_train_sig, y_train = load_apnea_ecg_segments_30s(apnea_dir)
-    x_target_sig, y_target = load_mitbih_psg_segments_30s(mit_dir)
+    x_train_sig, y_train = load_apnea_ecg_segments_30s(apnea_dir, harmonize_level=harmonize_level)
+    x_target_sig, y_target = load_mitbih_psg_segments_30s(mit_dir, harmonize_level=harmonize_level)
 
     x_val_sig, x_test_sig, y_val, y_test = train_test_split(
         x_target_sig,
@@ -482,7 +504,7 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, xgb_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, xgb_test_prob, threshold=tuned_threshold)
         report_cross_metrics("XGBoost", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("XGBoost", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        save_cross_metrics("XGBoost", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir, harmonize_level=harmonize_level)
         xgb_model_dir = ensure_model_dir("XGBoost", base_dir=run_dir)
         save_model_outputs("XGBoost", y_test, xgb_test_prob, (xgb_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         feature_names = metadata.get(
@@ -510,7 +532,7 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, cnn_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, cnn_test_prob, threshold=tuned_threshold)
         report_cross_metrics("CNN", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("CNN", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        save_cross_metrics("CNN", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir, harmonize_level=harmonize_level)
         cnn_model_dir = ensure_model_dir("CNN", base_dir=run_dir)
         save_model_outputs("CNN", y_test, cnn_test_prob, (cnn_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         _, cnn_test_uncertainty, _ = predict_probs_signal_mc_dropout(cnn_model, x_test_sig_n)
@@ -550,7 +572,7 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, fusion_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, fusion_test_prob, threshold=tuned_threshold)
         report_cross_metrics("FusionNet", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("FusionNet", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        save_cross_metrics("FusionNet", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir, harmonize_level=harmonize_level)
         fusion_model_dir = ensure_model_dir("FusionNet", base_dir=run_dir)
         save_model_outputs("FusionNet", y_test, fusion_test_prob, (fusion_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         save_uncertainty_outputs(fusion_model_dir, fusion_test_prob, fusion_test_uncertainty)
@@ -583,7 +605,7 @@ def evaluate_cross_mode(args, requested):
         tuned_threshold, best_val_score = tune_cross_threshold(y_val, meta_val_prob, threshold_metric)
         test_metrics = compute_cross_metrics(y_test, meta_test_prob, threshold=tuned_threshold)
         report_cross_metrics("Stacking", threshold_metric, tuned_threshold, best_val_score, test_metrics)
-        save_cross_metrics("Stacking", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir)
+        save_cross_metrics("Stacking", threshold_metric, tuned_threshold, best_val_score, test_metrics, base_dir=run_dir, harmonize_level=harmonize_level)
         stacking_dir = ensure_model_dir("Stacking", base_dir=run_dir)
         save_model_outputs("Stacking", y_test, meta_test_prob, (meta_test_prob >= tuned_threshold).astype(int), base_dir=run_dir)
         save_stacking_explainability(stacking_dir, meta_model)

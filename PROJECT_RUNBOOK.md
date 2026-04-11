@@ -92,7 +92,14 @@ Run from repo root:
 - Train selected models with source Apnea-ECG and target MIT-BIH PSG:
   - `python train.py --mode cross --models xgboost --cross-signal-mode ecg`
   - `python train.py --mode cross --models all --cross-signal-mode ecg_edr --threshold-metric balanced_accuracy`
-  - `python train.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data --cross-signal-mode ecg_edr`
+  - `python train.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data --cross-signal-mode ecg_edr --cross-harmonize-level light`
+  - `python train.py --mode cross --models all --no-cross-harmonize`
+
+- Cross-dataset preprocessing is harmonized by default.
+  - It applies the same ECG cleaning policy to both datasets before modeling.
+  - Default level is `light`.
+  - Use `--cross-harmonize-level full` for stronger filtering + clipping.
+  - Disable it with `--no-cross-harmonize` (equivalent to level `none`) for the older baseline behavior.
 
 - Cross-dataset mode now supports both:
   - `ecg` (1-channel baseline)
@@ -102,6 +109,8 @@ Run from repo root:
   - `--apnea-dir` source dataset path (default: `apnea_data`)
   - `--mit-dir` target dataset path (default: `mitbih_psg_data`)
   - `--cross-signal-mode` one of `ecg` or `ecg_edr` (default: `ecg`)
+  - `--cross-harmonize-level` one of `none`, `light`, `full` (default: `light`)
+  - `--no-cross-harmonize` shortcut for `--cross-harmonize-level none`
   - `--mit-val-size` MIT val split ratio for threshold tuning (default: `0.3`)
   - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
   - `--random-state` random seed for MIT val/test split
@@ -140,13 +149,22 @@ Run from repo root:
   - `python evaluate.py --mode cross --models xgboost --cross-signal-mode ecg`
   - `python evaluate.py --mode cross --models all --threshold-metric balanced_accuracy`
   - `python evaluate.py --mode cross --models all --apnea-dir apnea_data --mit-dir mitbih_psg_data`
-  - `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr`
+  - `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level light`
+  - `python evaluate.py --mode cross --models all --no-cross-harmonize`
+
+- Cross-dataset preprocessing is harmonized by default.
+  - Default level is taken from run metadata.
+  - You can override with `--cross-harmonize-level none|light|full`.
+  - Disable it with `--no-cross-harmonize` if you want the older baseline behavior.
 
 - Cross evaluation defaults to `--cross-signal-mode ecg`.
 
 - Optional cross-mode flags:
   - `--apnea-dir` source dataset path
   - `--mit-dir` target dataset path
+  - `--cross-signal-mode` one of `ecg` or `ecg_edr`
+  - `--cross-harmonize-level` one of `none`, `light`, `full` (override)
+  - `--no-cross-harmonize` shortcut for `--cross-harmonize-level none`
   - `--mit-val-size` MIT val split ratio
   - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
   - `--random-state` random seed for MIT val/test split
@@ -221,6 +239,8 @@ Cross-dataset artifacts:
 - cross-trained model files and evaluation outputs are saved under mode-specific folders:
   - `artifacts/cross-dataset-models/ecg/`
   - `artifacts/cross-dataset-models/ecg_edr/`
+- within each mode folder, the harmonization choice is recorded in `metadata.json` and `metrics.json`
+  - `metadata.json` also records `harmonize_preprocessing`, `cross_signal_mode`, and the source/target paths used
 - model files (as trained):
   - `artifacts/cross-dataset-models/<mode>/xgb_model.joblib`
   - `artifacts/cross-dataset-models/<mode>/cnn_model.pt`
@@ -245,8 +265,9 @@ Cross-dataset artifacts:
 ### Cross-dataset experiment
 1. `python train.py --mode cross --models all --cross-signal-mode ecg --threshold-metric balanced_accuracy`
 2. `python evaluate.py --mode cross --models all --cross-signal-mode ecg --threshold-metric balanced_accuracy`
-3. Optional ECG+EDR run: `python train.py --mode cross --models all --cross-signal-mode ecg_edr --threshold-metric balanced_accuracy`
-4. Optional ECG+EDR eval: `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --threshold-metric balanced_accuracy`
+3. Optional ECG+EDR run: `python train.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level light --threshold-metric balanced_accuracy`
+4. Optional ECG+EDR eval: `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level light --threshold-metric balanced_accuracy`
+5. To reproduce the older non-harmonized baseline, add `--no-cross-harmonize` to train and evaluate.
 
 ### Fast iteration on one model
 1. Train one model, e.g. `python train.py --mode normal --models cnn`
