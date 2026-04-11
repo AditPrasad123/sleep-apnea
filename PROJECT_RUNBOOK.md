@@ -300,6 +300,15 @@ Cross-dataset artifacts:
 6. Optional ECG+EDR eval: `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level light --threshold-metric balanced_accuracy`
 7. To reproduce the older non-harmonized baseline, add `--no-cross-harmonize` to train and evaluate.
 
+### One-command full cross ablation suite
+- Run all models across all signal modes (`ecg`, `edr`, `ecg_edr`) and harmonization levels (`none`, `light`, `full`):
+  - `python run_cross_ablation_suite.py`
+- Optional examples:
+  - train only: `python run_cross_ablation_suite.py --train-only`
+  - evaluate only (expects trained artifacts): `python run_cross_ablation_suite.py --evaluate-only`
+  - stop at first failure: `python run_cross_ablation_suite.py --fail-fast`
+  - threshold metric: `python run_cross_ablation_suite.py --threshold-metric balanced_accuracy`
+
 ### Fast iteration on one model
 1. Train one model, e.g. `python train.py --mode normal --models cnn`
 2. Evaluate one model, e.g. `python evaluate.py --mode normal --models cnn`

@@ -1113,9 +1113,11 @@ def compute_signal_saliency_signal_only(model, signal_sample):
     signal_tensor.requires_grad_(True)
     model.zero_grad(set_to_none=True)
 
-    logits = model(signal_tensor)
-    probability = torch.sigmoid(logits)[0]
-    probability.backward()
+    # CuDNN RNN backward can fail in eval mode; disable CuDNN only for saliency backward.
+    with torch.backends.cudnn.flags(enabled=False):
+        logits = model(signal_tensor)
+        probability = torch.sigmoid(logits)[0]
+        probability.backward()
 
     saliency = signal_tensor.grad.detach().abs().cpu().numpy()[0]
     if saliency.ndim == 1:
