@@ -18,9 +18,11 @@ from pipeline import (
     WINDOW_SECONDS,
     FS,
     artifact_path,
+    build_signal_view,
     build_ecg_edr_signal,
     build_feature_matrix,
     build_train_test_split,
+    compare_threshold_metrics,
     compute_class_weights,
     ensure_artifact_dir,
     load_apnea_ecg_segments_30s,
@@ -76,9 +78,9 @@ def parse_args():
     )
     parser.add_argument(
         "--cross-signal-mode",
-        choices=["ecg", "ecg_edr"],
+        choices=["ecg", "edr", "ecg_edr"],
         default="ecg",
-        help="Cross mode signal input for CNN/FusionNet/Stacking: ecg (1-channel) or ecg_edr (2-channel).",
+        help="Cross mode signal input for CNN/FusionNet/Stacking: ecg, edr, or ecg_edr.",
     )
     parser.add_argument(
         "--cross-harmonize-level",
@@ -96,6 +98,19 @@ def parse_args():
 
 def cross_run_dir(signal_mode):
     return os.path.join(CROSS_ARTIFACT_DIR, signal_mode)
+
+
+def harmonize_dir_name(harmonize_level):
+    mapping = {
+        "none": "no_harmonization",
+        "light": "light_harmonization",
+        "full": "full_harmonization",
+    }
+    return mapping[harmonize_level]
+
+
+def cross_model_run_dir(model_key, signal_mode, harmonize_level):
+    return os.path.join(CROSS_ARTIFACT_DIR, model_key, signal_mode, harmonize_dir_name(harmonize_level))
 
 
 def resolve_requested_models(raw_models):
@@ -253,8 +268,12 @@ def run_cross_training(args, requested):
     summarize_split("MIT-BIH PSG val", y_val)
     summarize_split("MIT-BIH PSG test", y_test)
 
-    run_dir = cross_run_dir(args.cross_signal_mode)
-    ensure_artifact_dir(base_dir=run_dir)
+    model_dirs = {
+        model_key: cross_model_run_dir(model_key, args.cross_signal_mode, harmonize_level)
+        for model_key in ["xgboost", "cnn", "fusionnet", "stacking"]
+    }
+    for model_dir in model_dirs.values():
+        ensure_artifact_dir(base_dir=model_dir)
 
     if len(x_train_sig) == 0 or len(x_val_sig) == 0 or len(x_test_sig) == 0:
         raise RuntimeError("Empty split after preprocessing. Check paths and preprocessing filters.")
@@ -266,16 +285,19 @@ def run_cross_training(args, requested):
     x_train_feat = scaler.fit_transform(x_train_feat_raw)
     x_val_feat = scaler.transform(x_val_feat_raw)
 
-    joblib.dump(scaler, artifact_path("scaler.joblib", base_dir=run_dir))
+    for model_dir in model_dirs.values():
+        joblib.dump(scaler, artifact_path("scaler.joblib", base_dir=model_dir))
 
-    if args.cross_signal_mode == "ecg_edr":
-        x_train_sig_n = build_ecg_edr_signal(x_train_sig, fs=FS)
-        x_val_sig_n = build_ecg_edr_signal(x_val_sig, fs=FS)
-        cross_signal_streams = ["ecg", "edr"]
-    else:
-        x_train_sig_n = x_train_sig[..., np.newaxis]
-        x_val_sig_n = x_val_sig[..., np.newaxis]
-        cross_signal_streams = ["ecg"]
+    x_train_sig_n, cross_signal_streams = build_signal_view(
+        x_train_sig,
+        args.cross_signal_mode,
+        fs=FS,
+    )
+    x_val_sig_n, _ = build_signal_view(
+        x_val_sig,
+        args.cross_signal_mode,
+        fs=FS,
+    )
 
     cross_signal_channels = int(x_train_sig_n.shape[2])
 
@@ -283,8 +305,10 @@ def run_cross_training(args, requested):
 
     xgb_train_prob = None
     xgb_val_prob = None
+    cnn_val_prob = None
     fusion_train_prob = None
     fusion_val_prob = None
+    meta_val_prob = None
 
     if "xgboost" in requested or "stacking" in requested:
         print("=== Cross Stage 1: Training XGBoost ===")
@@ -295,7 +319,7 @@ def run_cross_training(args, requested):
             y_val,
             scale,
         )
-        joblib.dump(xgb_model, artifact_path("xgb_model.joblib", base_dir=run_dir))
+        joblib.dump(xgb_model, artifact_path("xgb_model.joblib", base_dir=model_dirs["xgboost"]))
 
     if "cnn" in requested:
         print("=== Cross Stage 2: Training CNN ===")
@@ -307,7 +331,8 @@ def run_cross_training(args, requested):
             pos_weight,
             input_channels=cross_signal_channels,
         )
-        torch.save(cnn_model.state_dict(), artifact_path("cnn_model.pt", base_dir=run_dir))
+        cnn_val_prob = predict_probs_signal(cnn_model, x_val_sig_n)
+        torch.save(cnn_model.state_dict(), artifact_path("cnn_model.pt", base_dir=model_dirs["cnn"]))
 
     if "fusionnet" in requested or "stacking" in requested:
         print("=== Cross Stage 3: Training FusionNet ===")
@@ -324,7 +349,7 @@ def run_cross_training(args, requested):
         )
         fusion_train_prob = predict_probs(fusion_model, x_train_sig_n, x_train_feat)
         fusion_val_prob = predict_probs(fusion_model, x_val_sig_n, x_val_feat)
-        torch.save(fusion_model.state_dict(), artifact_path("fusion_model.pt", base_dir=run_dir))
+        torch.save(fusion_model.state_dict(), artifact_path("fusion_model.pt", base_dir=model_dirs["fusionnet"]))
 
     if "stacking" in requested:
         print("=== Cross Stage 4: Training Stacking Meta Model ===")
@@ -336,9 +361,11 @@ def run_cross_training(args, requested):
             y_train,
             y_val,
         )
-        joblib.dump(meta_model, artifact_path("stacking_model.joblib", base_dir=run_dir))
+        meta_val_prob = meta_model.predict_proba(np.column_stack([xgb_val_prob, fusion_val_prob]))[:, 1]
+        joblib.dump(meta_model, artifact_path("stacking_model.joblib", base_dir=model_dirs["stacking"]))
 
     threshold_info = {}
+    threshold_comparison = {}
     if xgb_val_prob is not None:
         threshold, score = tune_cross_threshold(y_val, xgb_val_prob, args.threshold_metric)
         threshold_info["xgboost"] = {
@@ -346,6 +373,15 @@ def run_cross_training(args, requested):
             "threshold": threshold,
             "val_score": score,
         }
+        threshold_comparison["xgboost"] = compare_threshold_metrics(y_val, xgb_val_prob)
+    if cnn_val_prob is not None:
+        threshold, score = tune_cross_threshold(y_val, cnn_val_prob, args.threshold_metric)
+        threshold_info["cnn"] = {
+            "metric": args.threshold_metric,
+            "threshold": threshold,
+            "val_score": score,
+        }
+        threshold_comparison["cnn"] = compare_threshold_metrics(y_val, cnn_val_prob)
     if fusion_val_prob is not None:
         threshold, score = tune_cross_threshold(y_val, fusion_val_prob, args.threshold_metric)
         threshold_info["fusionnet"] = {
@@ -353,34 +389,63 @@ def run_cross_training(args, requested):
             "threshold": threshold,
             "val_score": score,
         }
+        threshold_comparison["fusionnet"] = compare_threshold_metrics(y_val, fusion_val_prob)
+    if meta_val_prob is not None:
+        threshold, score = tune_cross_threshold(y_val, meta_val_prob, args.threshold_metric)
+        threshold_info["stacking"] = {
+            "metric": args.threshold_metric,
+            "threshold": threshold,
+            "val_score": score,
+        }
+        threshold_comparison["stacking"] = compare_threshold_metrics(y_val, meta_val_prob)
 
-    save_json(
-        {
-            "mode": "cross",
-            "artifact_dir": run_dir,
-            "fs": FS,
-            "apnea_dir": args.apnea_dir,
-            "mit_dir": args.mit_dir,
-            "mit_val_size": args.mit_val_size,
-            "random_state": args.random_state,
-            "threshold_metric": args.threshold_metric,
-            "harmonize_preprocessing": harmonize_level != "none",
-            "cross_harmonize_level": harmonize_level,
-            "cross_signal_mode": args.cross_signal_mode,
-            "feature_dim": int(x_train_feat.shape[1]),
-            "feature_names": FEATURE_NAMES,
-            "signal_channels": cross_signal_channels,
-            "signal_streams": cross_signal_streams,
-            "source_train_size": int(len(y_train)),
-            "target_val_size": int(len(y_val)),
-            "target_test_size": int(len(y_test)),
-            "trained_models": sorted(list(requested)),
-            "precomputed_thresholds": threshold_info,
-        },
-        "metadata.json",
-        base_dir=run_dir,
-    )
-    print(f"Saved/updated cross-dataset model artifacts in {run_dir}/")
+    for model_key, model_dir in model_dirs.items():
+        model_threshold_info = threshold_info.get(model_key)
+        model_threshold_comparison = threshold_comparison.get(model_key)
+
+        save_json(
+            {
+                "target_dataset": "mitbih_psg",
+                "selection_metric": args.threshold_metric,
+                "signal_mode": args.cross_signal_mode,
+                "harmonize_level": harmonize_level,
+                "model": model_key,
+                "thresholds": model_threshold_comparison,
+            },
+            "threshold_calibration.json",
+            base_dir=model_dir,
+        )
+
+        save_json(
+            {
+                "mode": "cross",
+                "artifact_dir": model_dir,
+                "model": model_key,
+                "fs": FS,
+                "apnea_dir": args.apnea_dir,
+                "mit_dir": args.mit_dir,
+                "mit_val_size": args.mit_val_size,
+                "random_state": args.random_state,
+                "threshold_metric": args.threshold_metric,
+                "harmonize_preprocessing": harmonize_level != "none",
+                "cross_harmonize_level": harmonize_level,
+                "cross_signal_mode": args.cross_signal_mode,
+                "feature_dim": int(x_train_feat.shape[1]),
+                "feature_names": FEATURE_NAMES,
+                "signal_channels": cross_signal_channels,
+                "signal_streams": cross_signal_streams,
+                "source_train_size": int(len(y_train)),
+                "target_val_size": int(len(y_val)),
+                "target_test_size": int(len(y_test)),
+                "trained_models": sorted(list(requested)),
+                "precomputed_threshold": model_threshold_info,
+                "threshold_metric_comparison": model_threshold_comparison,
+            },
+            "metadata.json",
+            base_dir=model_dir,
+        )
+
+    print(f"Saved/updated cross-dataset model artifacts in {CROSS_ARTIFACT_DIR}/")
 
 
 def main():

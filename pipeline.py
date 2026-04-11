@@ -38,6 +38,7 @@ TRAIN_BATCH_SIZE = 32
 EVAL_BATCH_SIZE = 64
 MC_DROPOUT_PASSES = 25
 SIGNAL_CHANNELS = 2
+THRESHOLD_METRICS = ("f1", "balanced_accuracy", "mcc")
 
 FEATURE_NAMES = [
     "mean",
@@ -445,6 +446,34 @@ def tune_cross_threshold(y_true, y_prob, metric_name):
             best_threshold = float(threshold)
 
     return best_threshold, float(best_score)
+
+
+def compare_threshold_metrics(y_true, y_prob, metric_names=THRESHOLD_METRICS):
+    comparison = {}
+    for metric_name in metric_names:
+        threshold, score = tune_cross_threshold(y_true, y_prob, metric_name)
+        comparison[metric_name] = {
+            "threshold": float(threshold),
+            "val_score": float(score),
+        }
+    return comparison
+
+
+def build_signal_view(x_signal, signal_mode, fs=FS):
+    if signal_mode == "ecg_edr":
+        signal_arr = build_ecg_edr_signal(x_signal, fs=fs)
+        return signal_arr, ["ecg", "edr"]
+
+    if signal_mode == "ecg":
+        signal_arr = np.asarray(x_signal, dtype=np.float32)[..., np.newaxis]
+        return signal_arr, ["ecg"]
+
+    if signal_mode == "edr":
+        edr_signal = np.array([derive_edr_from_ecg(seg, fs=fs) for seg in np.asarray(x_signal)], dtype=np.float32)
+        signal_arr = edr_signal[..., np.newaxis]
+        return signal_arr, ["edr"]
+
+    raise ValueError(f"Unsupported signal_mode: {signal_mode}")
 
 
 def extract_features(segment, fs=FS):
