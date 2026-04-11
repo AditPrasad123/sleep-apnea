@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wfdb
 from scipy.signal import butter, find_peaks, filtfilt, resample_poly
 from scipy.stats import kurtosis, skew
@@ -173,6 +174,65 @@ class CNNBaseline(nn.Module):
     def forward(self, signal):
         features = self.backbone(signal)
         logits = self.classifier(features).squeeze(1)
+        return logits
+
+
+class ChunkCNNLSTM(nn.Module):
+    def __init__(self, input_channels=SIGNAL_CHANNELS, fs=FS, chunk_seconds=5):
+        super().__init__()
+        self.chunk_samples = int(fs * chunk_seconds)
+
+        self.chunk_encoder = nn.Sequential(
+            nn.Conv1d(input_channels, 32, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(64, 96, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(96),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+
+        self.temporal_lstm = nn.LSTM(
+            input_size=96,
+            hidden_size=64,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, signal):
+        batch_size, channels, timesteps = signal.shape
+
+        remainder = timesteps % self.chunk_samples
+        if remainder != 0:
+            pad = self.chunk_samples - remainder
+            signal = F.pad(signal, (0, pad))
+            timesteps = timesteps + pad
+
+        chunk_count = timesteps // self.chunk_samples
+        chunked = signal.view(batch_size, channels, chunk_count, self.chunk_samples)
+        chunked = chunked.permute(0, 2, 1, 3).contiguous()
+        chunked = chunked.view(batch_size * chunk_count, channels, self.chunk_samples)
+
+        chunk_embeddings = self.chunk_encoder(chunked)
+        chunk_embeddings = chunk_embeddings.view(batch_size, chunk_count, -1)
+
+        temporal_features, _ = self.temporal_lstm(chunk_embeddings)
+        last_features = temporal_features[:, -1, :]
+        logits = self.classifier(last_features).squeeze(1)
         return logits
 
 
@@ -823,6 +883,66 @@ def train_cnn_baseline(
 
         val_acc = correct / total if total > 0 else 0.0
         print(f"CNN Epoch {epoch + 1}/{EPOCHS} - loss: {avg_loss:.4f} - val_acc: {val_acc:.4f}")
+
+    return model
+
+
+def train_chunk_cnn_lstm(
+    x_signal_train,
+    x_signal_test,
+    y_train,
+    y_test,
+    pos_weight,
+    input_channels=SIGNAL_CHANNELS,
+):
+    x_signal_train_t = torch.tensor(x_signal_train.transpose(0, 2, 1), dtype=torch.float32)
+    x_signal_test_t = torch.tensor(x_signal_test.transpose(0, 2, 1), dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32)
+    y_test_t = torch.tensor(y_test, dtype=torch.float32)
+
+    train_dataset = TensorDataset(x_signal_train_t, y_train_t)
+    test_dataset = TensorDataset(x_signal_test_t, y_test_t)
+
+    train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=EVAL_BATCH_SIZE, shuffle=False)
+
+    model = ChunkCNNLSTM(input_channels=input_channels).to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
+
+    for epoch in range(EPOCHS):
+        model.train()
+        running_loss = 0.0
+
+        for sig_batch, y_batch in train_loader:
+            sig_batch = sig_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+
+            optimizer.zero_grad()
+            logits = model(sig_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * sig_batch.size(0)
+
+        avg_loss = running_loss / len(train_loader.dataset)
+
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for sig_batch, y_batch in test_loader:
+                sig_batch = sig_batch.to(DEVICE)
+                y_batch = y_batch.to(DEVICE)
+                logits = model(sig_batch)
+                probs = torch.sigmoid(logits)
+                preds = (probs >= 0.5).float()
+                correct += (preds == y_batch).sum().item()
+                total += y_batch.size(0)
+
+        val_acc = correct / total if total > 0 else 0.0
+        print(f"ChunkCNNLSTM Epoch {epoch + 1}/{EPOCHS} - loss: {avg_loss:.4f} - val_acc: {val_acc:.4f}")
 
     return model
 

@@ -1,11 +1,12 @@
 # Sleep Apnea Project Runbook
 
 ## What This Project Is
-This repository trains and evaluates sleep apnea classifiers from ECG signals (Apnea-ECG dataset) using four model tracks:
+This repository trains and evaluates sleep apnea classifiers from ECG signals (Apnea-ECG dataset) using five model tracks:
 1. XGBoost (engineered features)
 2. CNN baseline (raw signal)
-3. FusionNet (CNN + LSTM + engineered feature branch)
-4. Stacking meta-model (XGBoost + FusionNet probabilities)
+3. ChunkCNNLSTM (5-second CNN chunk encoder + LSTM)
+4. FusionNet (CNN + LSTM + engineered feature branch)
+5. Stacking meta-model (XGBoost + FusionNet probabilities)
 
 ## Current File Roles
 - `download_dataset.py`: downloads Apnea-ECG into `apnea_data/`
@@ -28,17 +29,19 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 ## Models and What Exists
 1. XGBoost: engineered features only
 2. CNN baseline: 2-channel ECG+EDR signal
-3. FusionNet: CNN + BiLSTM on ECG+EDR signal + dense feature branch
-4. Stacking: XGBoost + FusionNet probabilities into XGBoost meta-model
+3. ChunkCNNLSTM: 5-second chunk CNN encoder + LSTM over chunk embeddings
+4. FusionNet: CNN + BiLSTM on ECG+EDR signal + dense feature branch
+5. Stacking: XGBoost + FusionNet probabilities into XGBoost meta-model
 
 ## Model Inputs At A Glance
 1. XGBoost uses handcrafted features only.
 2. CNN uses raw signal windows only.
-3. FusionNet uses two inputs:
+3. ChunkCNNLSTM uses raw signal windows only, split internally into 5-second chunks.
+4. FusionNet uses two inputs:
   - signal stream: ECG or ECG+EDR, depending on mode
   - feature stream: handcrafted features from the same window
   The two learned embeddings are concatenated before the final classifier.
-4. Stacking uses model probabilities only:
+5. Stacking uses model probabilities only:
   - XGBoost probability
   - FusionNet probability
   These are fused in a meta XGBoost model.
@@ -53,6 +56,10 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 - Temporal saliency map is generated (most uncertain test sample).
 
 ### FusionNet
+- Monte Carlo dropout uncertainty is generated during evaluation.
+- Temporal saliency map is generated (most uncertain test sample).
+
+### ChunkCNNLSTM
 - Monte Carlo dropout uncertainty is generated during evaluation.
 - Temporal saliency map is generated (most uncertain test sample).
 
@@ -78,6 +85,9 @@ Run from repo root:
 - Train only CNN baseline:
   - `python train.py --mode normal --models cnn`
 
+- Train only ChunkCNNLSTM:
+  - `python train.py --mode normal --models chunknet`
+
 - Train only FusionNet:
   - `python train.py --mode normal --models fusionnet`
 
@@ -86,7 +96,10 @@ Run from repo root:
 
 - Train multiple selected models:
   - `python train.py --mode normal --models xgboost cnn`
-  - `python train.py --mode normal --models cnn fusionnet`
+  - `python train.py --mode normal --models cnn chunknet fusionnet`
+
+- Available model keys for `--models`:
+  - `xgboost`, `cnn`, `chunknet`, `fusionnet`, `stacking`, `all`
 
 ### Cross-dataset mode
 - Train selected models with source Apnea-ECG and target MIT-BIH PSG:
@@ -141,6 +154,9 @@ Run from repo root:
 - Evaluate only CNN baseline:
   - `python evaluate.py --mode normal --models cnn`
 
+- Evaluate only ChunkCNNLSTM:
+  - `python evaluate.py --mode normal --models chunknet`
+
 - Evaluate only FusionNet:
   - `python evaluate.py --mode normal --models fusionnet`
 
@@ -149,6 +165,9 @@ Run from repo root:
 
 - Evaluate multiple selected models:
   - `python evaluate.py --mode normal --models xgboost fusionnet`
+
+- Available model keys for `--models`:
+  - `xgboost`, `cnn`, `chunknet`, `fusionnet`, `stacking`, `all`
 
 ### Cross-dataset mode
 - Evaluate selected models against MIT-BIH val/test with tuned threshold:
@@ -201,12 +220,14 @@ Top-level artifacts:
 - model files (as trained):
   - `artifacts/xgb_model.joblib`
   - `artifacts/cnn_model.pt`
+  - `artifacts/chunk_model.pt`
   - `artifacts/fusion_model.pt`
   - `artifacts/stacking_model.joblib`
 
 Per-model evaluation folders:
 - `artifacts/xgboost/`
 - `artifacts/cnn/`
+- `artifacts/chunkcnnlstm/`
 - `artifacts/fusionnet/`
 - `artifacts/stacking/`
 
@@ -233,6 +254,11 @@ Additional model-specific outputs:
   - `uncertainty.json`
   - `saliency_map_ecg.png`
   - `saliency_map_edr.png` (normal mode only, because normal mode uses ECG+EDR)
+- ChunkCNNLSTM:
+  - `uncertainty.png`
+  - `uncertainty.json`
+  - `saliency_map_ecg.png`
+  - `saliency_map_edr.png` (normal mode only, because normal mode uses ECG+EDR)
 - Stacking:
   - `meta_feature_importance.png`
   - `meta_feature_importance.json`
@@ -243,26 +269,21 @@ Additional model-specific outputs:
   - `uncertainty.json`
 
 Cross-dataset artifacts:
-- cross-trained model files and evaluation outputs are saved under mode-specific folders:
-  - `artifacts/cross-dataset-models/ecg/`
-  - `artifacts/cross-dataset-models/ecg_edr/`
-- within each mode folder, the harmonization choice is recorded in `metadata.json` and `metrics.json`
-  - `metadata.json` also records `harmonize_preprocessing`, `cross_signal_mode`, and the source/target paths used
-- model files (as trained):
-  - `artifacts/cross-dataset-models/<mode>/xgb_model.joblib`
-  - `artifacts/cross-dataset-models/<mode>/cnn_model.pt`
-  - `artifacts/cross-dataset-models/<mode>/fusion_model.pt`
-  - `artifacts/cross-dataset-models/<mode>/stacking_model.joblib`
-  - `artifacts/cross-dataset-models/<mode>/scaler.joblib`
-  - `artifacts/cross-dataset-models/<mode>/metadata.json`
-- per-model metrics folders:
-  - `artifacts/cross-dataset-models/<mode>/xgboost/metrics.json`
-  - `artifacts/cross-dataset-models/<mode>/cnn/metrics.json`
-  - `artifacts/cross-dataset-models/<mode>/fusionnet/metrics.json`
-  - `artifacts/cross-dataset-models/<mode>/stacking/metrics.json`
-- aggregate evaluation summary:
-  - `artifacts/cross-dataset-models/<mode>/evaluation_summary.json`
-  - `artifacts/cross-dataset-models/<mode>/threshold_calibration.json`
+- cross-trained model files and evaluation outputs are saved under:
+  - `artifacts/cross-dataset-models/<model>/<signal_mode>/<harmonization_level>/`
+- model keys:
+  - `xgboost`, `cnn`, `chunknet`, `fusionnet`, `stacking`
+- signal modes:
+  - `ecg`, `edr`, `ecg_edr`
+- harmonization folder names:
+  - `no_harmonization`, `light_harmonization`, `full_harmonization`
+- each leaf folder can contain:
+  - model file (`xgb_model.joblib`, `cnn_model.pt`, `chunk_model.pt`, `fusion_model.pt`, or `stacking_model.joblib`)
+  - `scaler.joblib`
+  - `metadata.json`
+  - `threshold_calibration.json`
+  - `evaluation_summary.json`
+  - evaluation plots and `metrics.json`
 
 ## Typical Run Recipes
 ### Full experiment from scratch
@@ -283,6 +304,12 @@ Cross-dataset artifacts:
 1. Train one model, e.g. `python train.py --mode normal --models cnn`
 2. Evaluate one model, e.g. `python evaluate.py --mode normal --models cnn`
 
+### Chunk model quick run
+1. `python train.py --mode normal --models chunknet`
+2. `python evaluate.py --mode normal --models chunknet`
+3. Cross-mode train: `python train.py --mode cross --models chunknet --cross-signal-mode ecg_edr --cross-harmonize-level light`
+4. Cross-mode eval: `python evaluate.py --mode cross --models chunknet --cross-signal-mode ecg_edr --cross-harmonize-level light --threshold-metric balanced_accuracy`
+
 ### Recompute only stacking
 1. `python train.py --mode normal --models stacking`
 2. `python evaluate.py --mode normal --models stacking`
@@ -295,7 +322,7 @@ Cross-dataset artifacts:
 5. MC dropout is used directly for CNN and FusionNet uncertainty; tree models do not use MC dropout directly.
 6. For stacking uncertainty, FusionNet MC-dropout samples are propagated through the stacking model.
 7. SHAP outputs are optional and are skipped automatically if SHAP is not installed.
-8. Cross-dataset runs write outputs under `artifacts/cross-dataset-models/<mode>/`.
+8. Cross-dataset runs write outputs under `artifacts/cross-dataset-models/<model>/<signal_mode>/<harmonization_level>/`.
 
 ## Paper-Oriented Reporting Pointers
 1. Use identical test split across all models (already enforced via saved indices).

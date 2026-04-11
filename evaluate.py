@@ -20,6 +20,7 @@ from sklearn.metrics import (
 )
 
 from pipeline import (
+    ChunkCNNLSTM,
     CNNBaseline,
     CROSS_ARTIFACT_DIR,
     DATA_DIR,
@@ -59,9 +60,9 @@ def parse_args():
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["all", "xgboost", "cnn", "fusionnet", "stacking"],
+        choices=["all", "xgboost", "cnn", "chunknet", "fusionnet", "stacking"],
         default=["all"],
-        help="Models to evaluate. Use one or more: xgboost cnn fusionnet stacking. Default: all",
+        help="Models to evaluate. Use one or more: xgboost cnn chunknet fusionnet stacking. Default: all",
     )
     parser.add_argument("--apnea-dir", default=DATA_DIR, help="Path to Apnea-ECG directory (cross mode).")
     parser.add_argument("--mit-dir", default="mitbih_psg_data", help="Path to MIT-BIH PSG directory (cross mode).")
@@ -122,7 +123,7 @@ def cross_model_run_dir(model_key, signal_mode, harmonize_level):
 
 def resolve_requested_models(raw_models):
     if "all" in raw_models:
-        return {"xgboost", "cnn", "fusionnet", "stacking"}
+        return {"xgboost", "cnn", "chunknet", "fusionnet", "stacking"}
     return set(raw_models)
 
 
@@ -474,11 +475,11 @@ def evaluate_cross_mode(args, requested):
 
     model_dirs = {
         model_key: cross_model_run_dir(model_key, args.cross_signal_mode, harmonize_level)
-        for model_key in ["xgboost", "cnn", "fusionnet", "stacking"]
+        for model_key in ["xgboost", "cnn", "chunknet", "fusionnet", "stacking"]
     }
 
     metadata = None
-    for model_key in ["xgboost", "cnn", "fusionnet", "stacking"]:
+    for model_key in ["xgboost", "cnn", "chunknet", "fusionnet", "stacking"]:
         metadata_path = artifact_path("metadata.json", base_dir=model_dirs[model_key])
         if os.path.exists(metadata_path):
             metadata = load_json("metadata.json", base_dir=model_dirs[model_key])
@@ -512,7 +513,14 @@ def evaluate_cross_mode(args, requested):
     summarize_split("MIT-BIH PSG val", y_val)
     summarize_split("MIT-BIH PSG test", y_test)
 
-    scaler = joblib.load(artifact_path("scaler.joblib", base_dir=model_dirs["xgboost"]))
+    scaler = None
+    for model_key in ["xgboost", "cnn", "chunknet", "fusionnet", "stacking"]:
+        scaler_path = artifact_path("scaler.joblib", base_dir=model_dirs[model_key])
+        if os.path.exists(scaler_path):
+            scaler = joblib.load(scaler_path)
+            break
+    if scaler is None:
+        raise FileNotFoundError("No cross-dataset scaler found for the requested configuration.")
     x_val_feat = scaler.transform(build_feature_matrix(x_val_sig))
     x_test_feat = scaler.transform(build_feature_matrix(x_test_sig))
 
@@ -619,6 +627,55 @@ def evaluate_cross_mode(args, requested):
             fs=cross_fs,
         )
         summary["cnn"] = {
+            "threshold": float(tuned_threshold),
+            "val_score": float(best_val_score),
+            **test_metrics,
+        }
+
+    if "chunknet" in requested:
+        chunk_model = ChunkCNNLSTM(input_channels=signal_channels).to(DEVICE)
+        chunk_model.load_state_dict(torch.load(artifact_path("chunk_model.pt", base_dir=model_dirs["chunknet"]), map_location=DEVICE))
+        chunk_model.eval()
+        chunk_val_prob = predict_probs_signal(chunk_model, x_val_sig_n)
+        chunk_test_prob = predict_probs_signal(chunk_model, x_test_sig_n)
+        threshold_calibration["chunknet"] = compare_threshold_metrics(y_val, chunk_val_prob)
+        tuned_threshold, best_val_score = tune_cross_threshold(y_val, chunk_val_prob, threshold_metric)
+        test_metrics = compute_cross_metrics(y_test, chunk_test_prob, threshold=tuned_threshold)
+        report_cross_metrics("ChunkCNNLSTM", threshold_metric, tuned_threshold, best_val_score, test_metrics)
+        save_cross_metrics(
+            "ChunkCNNLSTM",
+            threshold_metric,
+            tuned_threshold,
+            best_val_score,
+            test_metrics,
+            base_dir=model_dirs["chunknet"],
+            harmonize_level=harmonize_level,
+            model_dir=model_dirs["chunknet"],
+        )
+        chunk_model_dir = model_dirs["chunknet"]
+        save_model_outputs(
+            "ChunkCNNLSTM",
+            y_test,
+            chunk_test_prob,
+            (chunk_test_prob >= tuned_threshold).astype(int),
+            model_dir=model_dirs["chunknet"],
+        )
+        _, chunk_test_uncertainty, _ = predict_probs_signal_mc_dropout(chunk_model, x_test_sig_n)
+        save_uncertainty_outputs(chunk_model_dir, chunk_test_prob, chunk_test_uncertainty)
+
+        chunk_uncertain_index = int(np.argmax(chunk_test_uncertainty))
+        chunk_saliency, chunk_saliency_prob = compute_signal_saliency_signal_only(
+            chunk_model,
+            x_test_sig_n[chunk_uncertain_index].T,
+        )
+        save_saliency_plots(
+            chunk_model_dir,
+            x_test_sig_n[chunk_uncertain_index],
+            chunk_saliency,
+            chunk_saliency_prob,
+            fs=cross_fs,
+        )
+        summary["chunknet"] = {
             "threshold": float(tuned_threshold),
             "val_score": float(best_val_score),
             **test_metrics,
@@ -781,6 +838,7 @@ def main():
 
     xgb_model = None
     cnn_model = None
+    chunk_model = None
     fusion_model = None
     meta_model = None
 
@@ -799,6 +857,14 @@ def main():
         cnn_model = CNNBaseline(input_channels=signal_channels).to(DEVICE)
         cnn_model.load_state_dict(torch.load(cnn_path, map_location=DEVICE))
         cnn_model.eval()
+
+    if "chunknet" in requested:
+        chunk_path = artifact_path("chunk_model.pt")
+        ensure_file_exists(chunk_path)
+        signal_channels = int(metadata.get("signal_channels", 1))
+        chunk_model = ChunkCNNLSTM(input_channels=signal_channels).to(DEVICE)
+        chunk_model.load_state_dict(torch.load(chunk_path, map_location=DEVICE))
+        chunk_model.eval()
 
     if "fusionnet" in requested or "stacking" in requested:
         fusion_path = artifact_path("fusion_model.pt")
@@ -870,6 +936,27 @@ def main():
             x_signal_test[most_uncertain_index],
             saliency,
             saliency_prob,
+            fs=metadata["fs"],
+        )
+
+    if "chunknet" in requested:
+        chunk_prob, chunk_uncertainty, _ = predict_probs_signal_mc_dropout(chunk_model, x_signal_test)
+        chunk_pred = (chunk_prob >= 0.5).astype(int)
+        report_metrics(y_test, chunk_prob, chunk_pred, "ChunkCNNLSTM")
+        chunk_model_dir = ensure_model_dir("ChunkCNNLSTM")
+        save_model_outputs("ChunkCNNLSTM", y_test, chunk_prob, chunk_pred)
+        save_uncertainty_outputs(chunk_model_dir, chunk_prob, chunk_uncertainty)
+
+        chunk_uncertain_index = int(np.argmax(chunk_uncertainty))
+        chunk_saliency, chunk_saliency_prob = compute_signal_saliency_signal_only(
+            chunk_model,
+            x_signal_test[chunk_uncertain_index].T,
+        )
+        save_saliency_plots(
+            chunk_model_dir,
+            x_signal_test[chunk_uncertain_index],
+            chunk_saliency,
+            chunk_saliency_prob,
             fs=metadata["fs"],
         )
 

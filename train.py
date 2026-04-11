@@ -35,6 +35,7 @@ from pipeline import (
     summarize_split,
     tune_cross_threshold,
     train_cnn_baseline,
+    train_chunk_cnn_lstm,
     train_fusion_model,
     train_stacking,
     train_xgboost,
@@ -52,9 +53,9 @@ def parse_args():
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["all", "xgboost", "cnn", "fusionnet", "stacking"],
+        choices=["all", "xgboost", "cnn", "chunknet", "fusionnet", "stacking"],
         default=["all"],
-        help="Models to train. Use one or more: xgboost cnn fusionnet stacking. Default: all",
+        help="Models to train. Use one or more: xgboost cnn chunknet fusionnet stacking. Default: all",
     )
     parser.add_argument("--apnea-dir", default=DATA_DIR, help="Path to Apnea-ECG directory.")
     parser.add_argument("--mit-dir", default="mitbih_psg_data", help="Path to MIT-BIH PSG directory.")
@@ -115,7 +116,7 @@ def cross_model_run_dir(model_key, signal_mode, harmonize_level):
 
 def resolve_requested_models(raw_models):
     if "all" in raw_models:
-        return {"xgboost", "cnn", "fusionnet", "stacking"}
+        return {"xgboost", "cnn", "chunknet", "fusionnet", "stacking"}
     return set(raw_models)
 
 
@@ -211,6 +212,23 @@ def run_normal_training(requested):
         torch.save(cnn_model.state_dict(), artifact_path("cnn_model.pt"))
         print("Saved CNN baseline artifacts.")
 
+    if "chunknet" in requested:
+        print("=== Stage 5b: Training Model 2b (ChunkCNNLSTM: 5-second CNN chunks + LSTM) ===")
+        chunk_model = train_chunk_cnn_lstm(
+            x_signal_train,
+            x_signal_test,
+            y_train,
+            y_test,
+            pos_weight,
+            input_channels=x_signal.shape[2],
+        )
+        chunk_test_prob = predict_probs_signal(chunk_model, x_signal_test)
+        chunk_preds = (chunk_test_prob >= 0.5).astype(int)
+        chunk_acc = np.mean(chunk_preds == y_test)
+        print("ChunkCNNLSTM Accuracy:", chunk_acc)
+        torch.save(chunk_model.state_dict(), artifact_path("chunk_model.pt"))
+        print("Saved ChunkCNNLSTM artifacts.")
+
     if "fusionnet" in requested or "stacking" in requested:
         print("=== Stage 6: Training Model 3 (FusionNet: CNN + LSTM + Features) ===")
         fusion_model = train_fusion_model(
@@ -270,7 +288,7 @@ def run_cross_training(args, requested):
 
     model_dirs = {
         model_key: cross_model_run_dir(model_key, args.cross_signal_mode, harmonize_level)
-        for model_key in ["xgboost", "cnn", "fusionnet", "stacking"]
+        for model_key in ["xgboost", "cnn", "chunknet", "fusionnet", "stacking"]
     }
     for model_dir in model_dirs.values():
         ensure_artifact_dir(base_dir=model_dir)
@@ -306,6 +324,7 @@ def run_cross_training(args, requested):
     xgb_train_prob = None
     xgb_val_prob = None
     cnn_val_prob = None
+    chunk_val_prob = None
     fusion_train_prob = None
     fusion_val_prob = None
     meta_val_prob = None
@@ -333,6 +352,19 @@ def run_cross_training(args, requested):
         )
         cnn_val_prob = predict_probs_signal(cnn_model, x_val_sig_n)
         torch.save(cnn_model.state_dict(), artifact_path("cnn_model.pt", base_dir=model_dirs["cnn"]))
+
+    if "chunknet" in requested:
+        print("=== Cross Stage 2b: Training ChunkCNNLSTM ===")
+        chunk_model = train_chunk_cnn_lstm(
+            x_train_sig_n,
+            x_val_sig_n,
+            y_train,
+            y_val,
+            pos_weight,
+            input_channels=cross_signal_channels,
+        )
+        chunk_val_prob = predict_probs_signal(chunk_model, x_val_sig_n)
+        torch.save(chunk_model.state_dict(), artifact_path("chunk_model.pt", base_dir=model_dirs["chunknet"]))
 
     if "fusionnet" in requested or "stacking" in requested:
         print("=== Cross Stage 3: Training FusionNet ===")
@@ -382,6 +414,14 @@ def run_cross_training(args, requested):
             "val_score": score,
         }
         threshold_comparison["cnn"] = compare_threshold_metrics(y_val, cnn_val_prob)
+    if chunk_val_prob is not None:
+        threshold, score = tune_cross_threshold(y_val, chunk_val_prob, args.threshold_metric)
+        threshold_info["chunknet"] = {
+            "metric": args.threshold_metric,
+            "threshold": threshold,
+            "val_score": score,
+        }
+        threshold_comparison["chunknet"] = compare_threshold_metrics(y_val, chunk_val_prob)
     if fusion_val_prob is not None:
         threshold, score = tune_cross_threshold(y_val, fusion_val_prob, args.threshold_metric)
         threshold_info["fusionnet"] = {
