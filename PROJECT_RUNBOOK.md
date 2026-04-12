@@ -129,6 +129,9 @@ Run from repo root:
   - `--mit-val-size` MIT val split ratio for threshold tuning (default: `0.3`)
   - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
   - `--random-state` random seed for MIT val/test split
+  - `--few-shot-mit-frac` MIT few-shot adaptation fraction from the val split (default: `0.0`, disabled)
+  - `--few-shot-epochs` few-shot epochs for neural models (default: `5`)
+  - `--few-shot-lr` few-shot learning rate for neural models (default: `1e-4`)
 
 - Cross-training now also saves explicit MIT threshold calibration outputs:
   - `threshold_calibration.json` with per-model best threshold per metric (`f1`, `balanced_accuracy`, `mcc`)
@@ -194,6 +197,9 @@ Run from repo root:
   - `--mit-val-size` MIT val split ratio
   - `--threshold-metric` threshold tuning metric: `f1`, `balanced_accuracy`, `mcc`
   - `--random-state` random seed for MIT val/test split
+  - `--few-shot-mit-frac` few-shot fraction used in training (used to locate few-shot artifact folders)
+  - `--few-shot-epochs` few-shot epochs used in training (artifact path resolution)
+  - `--few-shot-lr` few-shot learning rate used in training (artifact path resolution)
 
 ### Evaluation dependency behavior
 - `stacking` evaluation requires:
@@ -269,8 +275,10 @@ Additional model-specific outputs:
   - `uncertainty.json`
 
 Cross-dataset artifacts:
-- cross-trained model files and evaluation outputs are saved under:
+- standard (non-few-shot) cross-trained model files and evaluation outputs are saved under:
   - `artifacts/cross-dataset-models/<model>/<signal_mode>/<harmonization_level>/`
+- few-shot cross-trained outputs are saved under a separate subtree (existing standard outputs are not moved):
+  - `artifacts/cross-dataset-models/few_shot/frac_<f>_ep_<e>_lr_<lr>/<model>/<signal_mode>/<harmonization_level>/`
 - model keys:
   - `xgboost`, `cnn`, `chunknet`, `fusionnet`, `stacking`
 - signal modes:
@@ -299,6 +307,10 @@ Cross-dataset artifacts:
 5. Optional ECG+EDR run: `python train.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level light --threshold-metric balanced_accuracy`
 6. Optional ECG+EDR eval: `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level light --threshold-metric balanced_accuracy`
 7. To reproduce the older non-harmonized baseline, add `--no-cross-harmonize` to train and evaluate.
+
+### Few-shot cross-dataset experiment (separate artifact folder)
+1. `python train.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level none --threshold-metric balanced_accuracy --few-shot-mit-frac 0.1 --few-shot-epochs 5 --few-shot-lr 1e-4`
+2. `python evaluate.py --mode cross --models all --cross-signal-mode ecg_edr --cross-harmonize-level none --threshold-metric balanced_accuracy --few-shot-mit-frac 0.1 --few-shot-epochs 5 --few-shot-lr 1e-4`
 
 ### One-command full cross ablation suite
 - Run all models across all signal modes (`ecg`, `edr`, `ecg_edr`) and harmonization levels (`none`, `light`, `full`):

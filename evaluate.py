@@ -101,11 +101,37 @@ def parse_args():
         action="store_true",
         help="Shortcut to set cross harmonization level to none.",
     )
+    parser.add_argument(
+        "--few-shot-mit-frac",
+        type=float,
+        default=0.0,
+        help="Few-shot fraction used during cross training. Set this to load few-shot artifact folders.",
+    )
+    parser.add_argument(
+        "--few-shot-epochs",
+        type=int,
+        default=5,
+        help="Few-shot epochs used during cross training (for artifact path resolution).",
+    )
+    parser.add_argument(
+        "--few-shot-lr",
+        type=float,
+        default=1e-4,
+        help="Few-shot learning rate used during cross training (for artifact path resolution).",
+    )
     return parser.parse_args()
 
 
 def cross_run_dir(signal_mode):
     return os.path.join(CROSS_ARTIFACT_DIR, signal_mode)
+
+
+def cross_artifact_root(args):
+    if args.few_shot_mit_frac <= 0.0:
+        return CROSS_ARTIFACT_DIR
+
+    few_shot_tag = f"frac_{args.few_shot_mit_frac:g}_ep_{args.few_shot_epochs}_lr_{args.few_shot_lr:g}"
+    return os.path.join(CROSS_ARTIFACT_DIR, "few_shot", few_shot_tag)
 
 
 def harmonize_dir_name(harmonize_level):
@@ -117,8 +143,8 @@ def harmonize_dir_name(harmonize_level):
     return mapping[harmonize_level]
 
 
-def cross_model_run_dir(model_key, signal_mode, harmonize_level):
-    return os.path.join(CROSS_ARTIFACT_DIR, model_key, signal_mode, harmonize_dir_name(harmonize_level))
+def cross_model_run_dir(artifact_root, model_key, signal_mode, harmonize_level):
+    return os.path.join(artifact_root, model_key, signal_mode, harmonize_dir_name(harmonize_level))
 
 
 def resolve_requested_models(raw_models):
@@ -473,8 +499,9 @@ def evaluate_cross_mode(args, requested):
     else:
         harmonize_level = "light"
 
+    artifact_root = cross_artifact_root(args)
     model_dirs = {
-        model_key: cross_model_run_dir(model_key, args.cross_signal_mode, harmonize_level)
+        model_key: cross_model_run_dir(artifact_root, model_key, args.cross_signal_mode, harmonize_level)
         for model_key in ["xgboost", "cnn", "chunknet", "fusionnet", "stacking"]
     }
 
@@ -806,7 +833,7 @@ def evaluate_cross_mode(args, requested):
                 indent=2,
             )
 
-    print(f"Saved cross-dataset metrics in {CROSS_ARTIFACT_DIR}/")
+    print(f"Saved cross-dataset metrics in {artifact_root}/")
 
 
 def main():

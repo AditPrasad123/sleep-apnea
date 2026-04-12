@@ -947,6 +947,110 @@ def train_chunk_cnn_lstm(
     return model
 
 
+def fine_tune_signal_model(
+    model,
+    x_signal_adapt,
+    y_adapt,
+    pos_weight,
+    epochs=5,
+    learning_rate=1e-4,
+):
+    if len(y_adapt) == 0:
+        return model
+
+    x_signal_adapt_t = torch.tensor(x_signal_adapt.transpose(0, 2, 1), dtype=torch.float32)
+    y_adapt_t = torch.tensor(y_adapt, dtype=torch.float32)
+    adapt_loader = DataLoader(
+        TensorDataset(x_signal_adapt_t, y_adapt_t),
+        batch_size=TRAIN_BATCH_SIZE,
+        shuffle=True,
+    )
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+
+        for sig_batch, y_batch in adapt_loader:
+            sig_batch = sig_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+
+            optimizer.zero_grad()
+            logits = model(sig_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * sig_batch.size(0)
+
+        avg_loss = running_loss / len(adapt_loader.dataset)
+        print(f"Few-shot signal fine-tune epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+
+    return model
+
+
+def fine_tune_fusion_model(
+    model,
+    x_signal_adapt,
+    x_feat_adapt,
+    y_adapt,
+    pos_weight,
+    epochs=5,
+    learning_rate=1e-4,
+):
+    if len(y_adapt) == 0:
+        return model
+
+    x_signal_adapt_t = torch.tensor(x_signal_adapt.transpose(0, 2, 1), dtype=torch.float32)
+    x_feat_adapt_t = torch.tensor(x_feat_adapt, dtype=torch.float32)
+    y_adapt_t = torch.tensor(y_adapt, dtype=torch.float32)
+
+    adapt_loader = DataLoader(
+        TensorDataset(x_signal_adapt_t, x_feat_adapt_t, y_adapt_t),
+        batch_size=TRAIN_BATCH_SIZE,
+        shuffle=True,
+    )
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+
+        for sig_batch, feat_batch, y_batch in adapt_loader:
+            sig_batch = sig_batch.to(DEVICE)
+            feat_batch = feat_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+
+            optimizer.zero_grad()
+            logits = model(sig_batch, feat_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * sig_batch.size(0)
+
+        avg_loss = running_loss / len(adapt_loader.dataset)
+        print(f"Few-shot fusion fine-tune epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
+
+    return model
+
+
+def fine_tune_xgboost_model(model, x_adapt_f, y_adapt):
+    if len(y_adapt) == 0:
+        return model
+
+    try:
+        model.fit(x_adapt_f, y_adapt, xgb_model=model.get_booster(), verbose=False)
+    except Exception:
+        # Fallback for older xgboost variants without booster-continuation support.
+        model.fit(x_adapt_f, y_adapt)
+    return model
+
+
 def predict_probs(model, signal_arr, feature_arr, batch_size=EVAL_BATCH_SIZE):
     model.eval()
     sig_t = torch.tensor(signal_arr.transpose(0, 2, 1), dtype=torch.float32)

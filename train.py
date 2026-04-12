@@ -25,6 +25,9 @@ from pipeline import (
     compare_threshold_metrics,
     compute_class_weights,
     ensure_artifact_dir,
+    fine_tune_fusion_model,
+    fine_tune_signal_model,
+    fine_tune_xgboost_model,
     load_apnea_ecg_segments_30s,
     load_mitbih_psg_segments_30s,
     load_segments_and_labels,
@@ -94,11 +97,37 @@ def parse_args():
         action="store_true",
         help="Shortcut to set cross harmonization level to none.",
     )
+    parser.add_argument(
+        "--few-shot-mit-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of MIT validation split to use for few-shot target adaptation (0 disables).",
+    )
+    parser.add_argument(
+        "--few-shot-epochs",
+        type=int,
+        default=5,
+        help="Few-shot fine-tuning epochs for neural models.",
+    )
+    parser.add_argument(
+        "--few-shot-lr",
+        type=float,
+        default=1e-4,
+        help="Few-shot fine-tuning learning rate for neural models.",
+    )
     return parser.parse_args()
 
 
 def cross_run_dir(signal_mode):
     return os.path.join(CROSS_ARTIFACT_DIR, signal_mode)
+
+
+def cross_artifact_root(args):
+    if args.few_shot_mit_frac <= 0.0:
+        return CROSS_ARTIFACT_DIR
+
+    few_shot_tag = f"frac_{args.few_shot_mit_frac:g}_ep_{args.few_shot_epochs}_lr_{args.few_shot_lr:g}"
+    return os.path.join(CROSS_ARTIFACT_DIR, "few_shot", few_shot_tag)
 
 
 def harmonize_dir_name(harmonize_level):
@@ -110,8 +139,8 @@ def harmonize_dir_name(harmonize_level):
     return mapping[harmonize_level]
 
 
-def cross_model_run_dir(model_key, signal_mode, harmonize_level):
-    return os.path.join(CROSS_ARTIFACT_DIR, model_key, signal_mode, harmonize_dir_name(harmonize_level))
+def cross_model_run_dir(artifact_root, model_key, signal_mode, harmonize_level):
+    return os.path.join(artifact_root, model_key, signal_mode, harmonize_dir_name(harmonize_level))
 
 
 def resolve_requested_models(raw_models):
@@ -282,12 +311,31 @@ def run_cross_training(args, requested):
         stratify=y_target,
     )
 
+    use_few_shot = args.few_shot_mit_frac > 0.0
+    if use_few_shot:
+        if not (0.0 < args.few_shot_mit_frac < 1.0):
+            raise ValueError("--few-shot-mit-frac must be in (0, 1).")
+
+        x_adapt_sig, x_val_sig, y_adapt, y_val = train_test_split(
+            x_val_sig,
+            y_val,
+            test_size=1.0 - args.few_shot_mit_frac,
+            random_state=args.random_state,
+            stratify=y_val,
+        )
+    else:
+        x_adapt_sig = np.empty((0, x_val_sig.shape[1]), dtype=x_val_sig.dtype)
+        y_adapt = np.empty((0,), dtype=y_val.dtype)
+
     summarize_split("Apnea-ECG train", y_train)
+    if use_few_shot:
+        summarize_split("MIT-BIH PSG few-shot adapt", y_adapt)
     summarize_split("MIT-BIH PSG val", y_val)
     summarize_split("MIT-BIH PSG test", y_test)
 
+    artifact_root = cross_artifact_root(args)
     model_dirs = {
-        model_key: cross_model_run_dir(model_key, args.cross_signal_mode, harmonize_level)
+        model_key: cross_model_run_dir(artifact_root, model_key, args.cross_signal_mode, harmonize_level)
         for model_key in ["xgboost", "cnn", "chunknet", "fusionnet", "stacking"]
     }
     for model_dir in model_dirs.values():
@@ -297,10 +345,12 @@ def run_cross_training(args, requested):
         raise RuntimeError("Empty split after preprocessing. Check paths and preprocessing filters.")
 
     x_train_feat_raw = build_feature_matrix(x_train_sig)
+    x_adapt_feat_raw = build_feature_matrix(x_adapt_sig) if use_few_shot else np.empty((0, len(FEATURE_NAMES)))
     x_val_feat_raw = build_feature_matrix(x_val_sig)
 
     scaler = StandardScaler()
     x_train_feat = scaler.fit_transform(x_train_feat_raw)
+    x_adapt_feat = scaler.transform(x_adapt_feat_raw) if use_few_shot else np.empty((0, x_train_feat.shape[1]))
     x_val_feat = scaler.transform(x_val_feat_raw)
 
     for model_dir in model_dirs.values():
@@ -316,6 +366,14 @@ def run_cross_training(args, requested):
         args.cross_signal_mode,
         fs=FS,
     )
+    if use_few_shot:
+        x_adapt_sig_n, _ = build_signal_view(
+            x_adapt_sig,
+            args.cross_signal_mode,
+            fs=FS,
+        )
+    else:
+        x_adapt_sig_n = np.empty((0, x_train_sig_n.shape[1], x_train_sig_n.shape[2]), dtype=np.float32)
 
     cross_signal_channels = int(x_train_sig_n.shape[2])
 
@@ -338,6 +396,11 @@ def run_cross_training(args, requested):
             y_val,
             scale,
         )
+        if use_few_shot:
+            print("=== Cross Stage 1b: Few-shot MIT fine-tuning (XGBoost) ===")
+            xgb_model = fine_tune_xgboost_model(xgb_model, x_adapt_feat, y_adapt)
+            xgb_train_prob = xgb_model.predict_proba(x_train_feat)[:, 1]
+            xgb_val_prob = xgb_model.predict_proba(x_val_feat)[:, 1]
         joblib.dump(xgb_model, artifact_path("xgb_model.joblib", base_dir=model_dirs["xgboost"]))
 
     if "cnn" in requested:
@@ -350,6 +413,16 @@ def run_cross_training(args, requested):
             pos_weight,
             input_channels=cross_signal_channels,
         )
+        if use_few_shot:
+            print("=== Cross Stage 2a: Few-shot MIT fine-tuning (CNN) ===")
+            cnn_model = fine_tune_signal_model(
+                cnn_model,
+                x_adapt_sig_n,
+                y_adapt,
+                pos_weight,
+                epochs=args.few_shot_epochs,
+                learning_rate=args.few_shot_lr,
+            )
         cnn_val_prob = predict_probs_signal(cnn_model, x_val_sig_n)
         torch.save(cnn_model.state_dict(), artifact_path("cnn_model.pt", base_dir=model_dirs["cnn"]))
 
@@ -363,6 +436,16 @@ def run_cross_training(args, requested):
             pos_weight,
             input_channels=cross_signal_channels,
         )
+        if use_few_shot:
+            print("=== Cross Stage 2c: Few-shot MIT fine-tuning (ChunkCNNLSTM) ===")
+            chunk_model = fine_tune_signal_model(
+                chunk_model,
+                x_adapt_sig_n,
+                y_adapt,
+                pos_weight,
+                epochs=args.few_shot_epochs,
+                learning_rate=args.few_shot_lr,
+            )
         chunk_val_prob = predict_probs_signal(chunk_model, x_val_sig_n)
         torch.save(chunk_model.state_dict(), artifact_path("chunk_model.pt", base_dir=model_dirs["chunknet"]))
 
@@ -381,6 +464,19 @@ def run_cross_training(args, requested):
         )
         fusion_train_prob = predict_probs(fusion_model, x_train_sig_n, x_train_feat)
         fusion_val_prob = predict_probs(fusion_model, x_val_sig_n, x_val_feat)
+        if use_few_shot:
+            print("=== Cross Stage 3b: Few-shot MIT fine-tuning (FusionNet) ===")
+            fusion_model = fine_tune_fusion_model(
+                fusion_model,
+                x_adapt_sig_n,
+                x_adapt_feat,
+                y_adapt,
+                pos_weight,
+                epochs=args.few_shot_epochs,
+                learning_rate=args.few_shot_lr,
+            )
+            fusion_train_prob = predict_probs(fusion_model, x_train_sig_n, x_train_feat)
+            fusion_val_prob = predict_probs(fusion_model, x_val_sig_n, x_val_feat)
         torch.save(fusion_model.state_dict(), artifact_path("fusion_model.pt", base_dir=model_dirs["fusionnet"]))
 
     if "stacking" in requested:
@@ -460,6 +556,7 @@ def run_cross_training(args, requested):
             {
                 "mode": "cross",
                 "artifact_dir": model_dir,
+                "artifact_root": artifact_root,
                 "model": model_key,
                 "fs": FS,
                 "apnea_dir": args.apnea_dir,
@@ -477,6 +574,11 @@ def run_cross_training(args, requested):
                 "source_train_size": int(len(y_train)),
                 "target_val_size": int(len(y_val)),
                 "target_test_size": int(len(y_test)),
+                "few_shot_mit_frac": float(args.few_shot_mit_frac),
+                "few_shot_adapt_size": int(len(y_adapt)),
+                "few_shot_epochs": int(args.few_shot_epochs),
+                "few_shot_lr": float(args.few_shot_lr),
+                "few_shot_enabled": bool(use_few_shot),
                 "trained_models": sorted(list(requested)),
                 "precomputed_threshold": model_threshold_info,
                 "threshold_metric_comparison": model_threshold_comparison,
@@ -485,7 +587,7 @@ def run_cross_training(args, requested):
             base_dir=model_dir,
         )
 
-    print(f"Saved/updated cross-dataset model artifacts in {CROSS_ARTIFACT_DIR}/")
+    print(f"Saved/updated cross-dataset model artifacts in {artifact_root}/")
 
 
 def main():
