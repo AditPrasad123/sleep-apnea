@@ -33,7 +33,14 @@ def build_common_args(args):
         args.apnea_dir,
         "--mit-dir",
         args.mit_dir,
+        "--few-shot-mit-frac",
+        str(args.few_shot_mit_frac),
+        "--few-shot-epochs",
+        str(args.few_shot_epochs),
+        "--few-shot-lr",
+        str(args.few_shot_lr),
     ]
+    
     return common
 
 
@@ -53,7 +60,7 @@ def run_suite(args):
     common = build_common_args(args)
     results = []
 
-    for signal_mode in SIGNAL_MODES:
+    for signal_mode in args.signal_modes:
         for harmonize_level in args.harmonize_levels:
             print("=" * 80)
             print(f"Running combo: signal_mode={signal_mode}, harmonize_level={harmonize_level}")
@@ -153,6 +160,31 @@ def parse_args():
         choices=HARMONIZE_LEVELS,
         default=list(HARMONIZE_LEVELS),
         help="One or more harmonization levels to run. Default: none light full.",
+    )
+    parser.add_argument(
+        "--signal-modes",
+        nargs="+",
+        choices=SIGNAL_MODES,
+        default=list(SIGNAL_MODES),
+        help="One or more signal modes to run. Default: ecg edr ecg_edr.",
+    )
+    parser.add_argument(
+        "--few-shot-mit-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of MIT validation split to use for few-shot adaptation. Default: 0.0 (disabled)",
+    )
+    parser.add_argument(
+        "--few-shot-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs for few-shot fine-tuning. Default: 5",
+    )
+    parser.add_argument(
+        "--few-shot-lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for few-shot fine-tuning. Default: 1e-4",
     )
     return parser.parse_args()
 

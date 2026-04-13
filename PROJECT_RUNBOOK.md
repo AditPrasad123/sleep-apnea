@@ -316,6 +316,7 @@ Cross-dataset artifacts:
 - Run all models across all signal modes (`ecg`, `edr`, `ecg_edr`) and harmonization levels (`none`, `light`, `full`):
   - `python run_cross_ablation_suite.py`
 - Optional examples:
+  - ECG + EDR only, light + full only, no few-shot: `python run_cross_ablation_suite.py --signal-modes ecg edr --harmonize-levels light full`
   - train only: `python run_cross_ablation_suite.py --train-only`
   - evaluate only (expects trained artifacts): `python run_cross_ablation_suite.py --evaluate-only`
   - stop at first failure: `python run_cross_ablation_suite.py --fail-fast`
