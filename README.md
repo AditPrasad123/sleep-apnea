@@ -71,6 +71,11 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 ### Confusion Matrix
 - Generated for every evaluated model.
 
+## Clone the Repository:
+Clone the repository and move into the project folder first:
+`git clone https://github.com/AditPrasad123/PFLlib.git`
+`cd PFLlib`
+
 ## Training CLI (Selective)
 Run from repo root:
 
