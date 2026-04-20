@@ -76,7 +76,7 @@ Clone the repository and move into the project folder first:
 
 ```cmd
 git clone https://github.com/AditPrasad123/sleep-apnea.git
-cd PFLlib
+cd sleep-apnea
 ```
 
 ## Training CLI (Selective)
