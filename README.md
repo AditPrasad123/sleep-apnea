@@ -73,8 +73,11 @@ This repository trains and evaluates sleep apnea classifiers from ECG signals (A
 
 ## Clone the Repository:
 Clone the repository and move into the project folder first:
-`git clone https://github.com/AditPrasad123/PFLlib.git`
-`cd PFLlib`
+
+```cmd
+git clone https://github.com/AditPrasad123/sleep-apnea.git
+cd PFLlib
+```
 
 ## Training CLI (Selective)
 Run from repo root:
